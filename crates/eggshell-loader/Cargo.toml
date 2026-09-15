@@ -1,0 +1,12 @@
+[package]
+name = "eggshell-loader"
+version.workspace = true
+edition.workspace = true
+description = "Turns an eggshell.toml into the plugin set the kernel boots"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+semver.workspace = true
+eggshell-protocol = { path = "../eggshell-protocol" }

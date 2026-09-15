@@ -1,0 +1,28 @@
+[package]
+name = "eggshell-kernel"
+version.workspace = true
+edition.workspace = true
+description = "eggshellmod kernel: plugin processes, capability routing, events, hot reload"
+
+[dependencies]
+serde_json.workspace = true
+tokio.workspace = true
+eggshell-protocol = { path = "../eggshell-protocol" }
+eggshell-loader = { path = "../eggshell-loader" }
+eggshell-log = { path = "../eggshell-log" }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[features]
+fixture = []
+
+[[bin]]
+name = "eggshell-fixture"
+path = "src/bin/eggshell-fixture.rs"
+required-features = ["fixture"]
+
+[[test]]
+name = "host"
+path = "tests/host.rs"
+required-features = ["fixture"]
