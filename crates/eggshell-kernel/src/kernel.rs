@@ -123,6 +123,9 @@ pub struct Report {
     pub plugins: Vec<Value>,
     pub capabilities: BTreeMap<String, Value>,
     pub start_order: Vec<String>,
+    /// The config files this run was composed of, base first. A layered config
+    /// is then visible in the report instead of assumed.
+    pub sources: Vec<String>,
 }
 
 impl Report {
@@ -145,6 +148,7 @@ impl Report {
             "plugins": self.plugins,
             "capabilities": self.capabilities,
             "planned_start_order": self.start_order,
+            "config_sources": self.sources,
         })
     }
 
@@ -156,6 +160,9 @@ impl Report {
         }
         for warning in &self.warnings {
             out.push_str(&format!("warning [{}] {}\n", codes::name(warning.code), warning.message));
+        }
+        if !self.sources.is_empty() {
+            out.push_str(&format!("config: {}\n", self.sources.join(" + ")));
         }
         let order: Vec<String> = self.start_order.clone();
         out.push_str(&format!(
@@ -323,7 +330,10 @@ impl Kernel {
         let kernel = Arc::new(Kernel::assemble(config, check, host));
         kernel.clone().start_processes().await?;
 
-        let mut report = Report::default();
+        // Seeded rather than blank: the report the kernel already carries names
+        // the config layers this boot came from, and every failure below is
+        // handed back to a caller who wants to know them.
+        let mut report = kernel.report.lock().unwrap().clone();
         let mut decls: BTreeMap<String, Decl> = BTreeMap::new();
         for id in kernel.ids() {
             let (timeout, plugin_config) = {
@@ -449,6 +459,9 @@ impl Kernel {
     }
 
     fn assemble(config: Config, check: bool, host: bool) -> Kernel {
+        let sources: Vec<String> =
+            config.sources.iter().map(|path| path.display().to_string()).collect();
+        let report = Report { sources, ..Report::default() };
         let mut plugins = BTreeMap::new();
         for (id, cfg) in &config.plugins {
             plugins.insert(
@@ -506,7 +519,7 @@ impl Kernel {
             shutdown_rx: Mutex::new(Some(shutdown_rx)),
             exit_tx: Mutex::new(Some(exit_tx)),
             exit_rx: Mutex::new(Some(exit_rx)),
-            report: Mutex::new(Report::default()),
+            report: Mutex::new(report),
             host: Mutex::new(Some(Host { rx: host_rx, bytes: host_bytes })),
             stopping: AtomicBool::new(false),
             force_reload: AtomicBool::new(false),
@@ -1601,9 +1614,7 @@ impl Kernel {
     // ---------------------------------------------------------- hot reload
 
     async fn reload_loop(self: Arc<Self>) {
-        let mut last = std::fs::read_to_string(&self.path)
-            .map(|text| Config::content_hash(&text))
-            .unwrap_or(0);
+        let mut last = Config::fingerprint(&self.path);
         let mut ticker = tokio::time::interval(Duration::from_millis(1000));
         loop {
             ticker.tick().await;
@@ -1611,21 +1622,23 @@ impl Kernel {
                 return;
             }
             let forced = self.force_reload.swap(false, Ordering::SeqCst);
-            let Ok(text) = std::fs::read_to_string(&self.path) else { continue };
-            let hash = Config::content_hash(&text);
+            // Every layer counts, not just the entry file: editing the base a
+            // local overlay extends is as much a config change as editing the
+            // overlay itself.
+            let hash = Config::fingerprint(&self.path);
             if !forced && hash == last {
                 continue;
             }
             // Advance the hash before trying: a config that fails stays failed
             // until the file actually changes again, instead of retrying forever.
             last = hash;
-            self.clone().reload(&text).await;
+            self.clone().reload().await;
         }
     }
 
-    async fn reload(self: Arc<Self>, text: &str) {
+    async fn reload(self: Arc<Self>) {
         let env = |name: &str| std::env::var(name).ok();
-        let fresh = match Config::parse(text, &self.path, &env) {
+        let fresh = match Config::load(&self.path, &env) {
             Ok(config) => config,
             Err(error) => {
                 log::error("kernel", &format!("reload rejected: {error}; keeping the running config"));

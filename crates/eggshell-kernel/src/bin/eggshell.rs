@@ -1,11 +1,15 @@
 //! The kernel as a process: any language can host it over a pipe.
 //!
-//!     eggshell <config.toml>
+//!     eggshell <config.toml> [--check] [--json]
 //!
-//! fd 0 carries the host's requests, fd 1 carries replies and notifications,
-//! fd 2 stays the kernel's own log (one JSON object per line). The plugin
-//! facing protocol is unchanged; the only difference is that the host is a pipe
-//! instead of an in-process `Host`.
+//! Without a flag, fd 0 carries the host's requests, fd 1 carries replies and
+//! notifications, fd 2 stays the kernel's own log (one JSON object per line).
+//! The plugin facing protocol is unchanged; the only difference is that the
+//! host is a pipe instead of an in-process `Host`.
+//!
+//! `--check` instead runs a configuration check: it initializes every plugin,
+//! validates the capability graph and prints the report on stdout, without ever
+//! sending `start`. `--json` picks that report's format.
 //!
 //! A host is a pure caller: it provides no capability, it has no process and it
 //! cannot be a routing target. The kernel labels its calls `meta.caller =
@@ -40,16 +44,56 @@ const OUT_QUEUE: usize = 16;
 /// done shutting down.
 const TAIL_GRACE: Duration = Duration::from_millis(250);
 
+const USAGE: &str = "\
+usage: eggshell <config.toml> [--check] [--json]
+
+  (no flag)  boot the plugins and serve the host protocol on fd 0 / fd 1
+  --check    initialize every plugin, validate the capability graph and print
+             the report on stdout; never sends `start`, never touches io
+  --json     print the --check report as one JSON object instead of text
+";
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    let path = match (args.next(), args.next()) {
-        (Some(path), None) => path,
-        _ => {
-            eprintln!("usage: eggshell <config.toml>");
-            return ExitCode::from(2);
+    let mut path: Option<String> = None;
+    let mut check = false;
+    let mut json = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--check" => check = true,
+            "--json" => json = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return ExitCode::from(0);
+            }
+            other if other.starts_with('-') => {
+                eprintln!("unknown option: {other}\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            other if path.is_none() => path = Some(other.to_string()),
+            other => {
+                eprintln!("unexpected argument: {other}\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
         }
+    }
+    let Some(path) = path else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
     };
+
+    // A configuration check ends here: `run` loads the config itself, so a
+    // config that cannot even be parsed still comes back as a report instead of
+    // a bare exit code.
+    if check {
+        let report = eggshell_kernel::run(&PathBuf::from(&path), true).await;
+        if json {
+            println!("{}", report.to_json());
+        } else {
+            print!("{}", report.to_text());
+        }
+        return ExitCode::from(u8::try_from(report.code).unwrap_or(1));
+    }
 
     let env = |name: &str| std::env::var(name).ok();
     let config = match Config::load(&PathBuf::from(&path), &env) {

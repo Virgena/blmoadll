@@ -423,3 +423,174 @@ async fn the_host_can_cancel_a_stream() {
     );
     assert_eq!(kernel.shutdown().await, 0);
 }
+
+/// The config check the docs promise: a report on stdout, no host frames, and
+/// never a `start`.
+#[tokio::test]
+async fn check_prints_a_report_on_stdout_and_never_sends_start() {
+    let dir = scratch("cli-check");
+    // `--exit-on-start` makes the fixture quit the moment it is told to start,
+    // so a check that passes proves `start` was never sent.
+    let path = config(&dir, &one_provider("demo.text=1.0.0", r#", "--exit-on-start""#));
+
+    let output = Command::new(EGGSHELL)
+        .arg(&path)
+        .args(["--check", "--json"])
+        .output()
+        .await
+        .expect("run the kernel");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // fd 1 carries the report here, not frames: a check has no host.
+    let report: Value = serde_json::from_slice(&output.stdout).expect("one JSON object on stdout");
+    assert_eq!(report["ok"], json!(true));
+    assert_eq!(report["capabilities"]["demo.text"]["plugin"], json!("provider"));
+    assert_eq!(report["planned_start_order"], json!(["provider"]));
+}
+
+/// A config the graph rejects exits 1 and names the slot it got wrong.
+#[tokio::test]
+async fn check_exits_one_and_names_the_slot_a_bad_config_gets_wrong() {
+    let dir = scratch("cli-check-bad");
+    let path = config(
+        &dir,
+        &format!(
+            r#"
+[plugins.provider]
+command = '{FIXTURE}'
+args = ["--provides", "demo.text=1.0.0"]
+
+[capability]
+"demo.nope" = "provider"
+"#
+        ),
+    );
+
+    let output = Command::new(EGGSHELL)
+        .arg(&path)
+        .arg("--check")
+        .output()
+        .await
+        .expect("run the kernel");
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("demo.nope"), "{text}");
+    assert!(text.contains("does not provide"), "{text}");
+}
+
+/// A config that names other config files: both layers count, and the report
+/// says which files it was made of instead of leaving that to the reader.
+#[tokio::test]
+async fn check_reads_every_layer_a_config_extends() {
+    let dir = scratch("layers-check");
+    let base = dir.join("base.toml");
+    std::fs::write(
+        &base,
+        format!(
+            r#"
+[plugins.provider]
+command = '{FIXTURE}'
+args = ["--provides", "demo.text=1.0.0"]
+"#
+        ),
+    )
+    .expect("write the base layer");
+    // The entry adds a row of its own: a layer is not only for overrides.
+    let local = dir.join("local.toml");
+    std::fs::write(
+        &local,
+        format!(
+            r#"
+extends = ["base.toml"]
+
+[plugins.extra]
+command = '{FIXTURE}'
+args = ["--provides", "demo.more=1.0.0"]
+"#
+        ),
+    )
+    .expect("write the entry layer");
+
+    let output = Command::new(EGGSHELL)
+        .arg(&local)
+        .args(["--check", "--json"])
+        .output()
+        .await
+        .expect("run the kernel");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let report: Value = serde_json::from_slice(&output.stdout).expect("one JSON object on stdout");
+    assert_eq!(report["ok"], json!(true), "{report}");
+    assert_eq!(report["capabilities"]["demo.text"]["plugin"], json!("provider"));
+    assert_eq!(report["capabilities"]["demo.more"]["plugin"], json!("extra"));
+    // Base first, entry last: the order the layers were applied in.
+    let sources: Vec<String> = report["config_sources"]
+        .as_array()
+        .expect("config_sources")
+        .iter()
+        .map(|value| value.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(sources, vec![base.display().to_string(), local.display().to_string()]);
+}
+
+/// The reloader watches the whole stack: editing a file *underneath* the entry
+/// is a config change like any other.
+#[tokio::test]
+async fn editing_a_base_layer_reloads_the_running_kernel() {
+    let dir = scratch("layers-reload");
+    let base = dir.join("base.toml");
+    let body = |extra: &str| {
+        format!(
+            r#"
+[plugins.provider]
+command = '{FIXTURE}'
+args = ["--provides", "demo.text=1.0.0"]
+{extra}
+"#
+        )
+    };
+    std::fs::write(&base, body("")).expect("write the base layer");
+    let local = dir.join("local.toml");
+    std::fs::write(&local, "extends = [\"base.toml\"]\n").expect("write the entry layer");
+
+    let mut kernel = HostProcess::spawn(&local).await;
+    // Let the first boot settle before touching a file the watcher is polling.
+    let id = kernel.request("capabilities", json!({})).await;
+    assert!(kernel.reply(&id).await["result"].is_object());
+
+    // A row the running config never had, added to the layer it extends.
+    let extra = format!(
+        r#"
+[plugins.extra]
+command = '{FIXTURE}'
+args = ["--provides", "demo.more=1.0.0"]
+"#
+    );
+    std::fs::write(&base, body(&extra)).expect("rewrite the base layer");
+
+    let mut reloaded = false;
+    for _ in 0..160 {
+        if kernel.logs().contains("reload applied") {
+            reloaded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(reloaded, "the reloader never saw the base layer change:\n{}", kernel.logs());
+
+    // The new row is live, which is the half a "reload applied" log cannot show.
+    let id = kernel
+        .request(
+            "invoke",
+            json!({"capability": "demo.more", "method": "echo", "params": {"hi": 1}}),
+        )
+        .await;
+    let reply = kernel.reply(&id).await;
+    assert_eq!(reply["result"]["got"]["hi"], json!(1), "{reply}");
+
+    assert_eq!(kernel.shutdown().await, 0);
+}

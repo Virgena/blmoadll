@@ -156,6 +156,11 @@ process.stdin.on("data", (chunk: Buffer) => {
 
 这一节的内容就是你的"启动参数"。配置里放什么完全由你和写配置的人约定，内核不看。
 
+内核确实不看: 这张表是不透明 JSON，它不校验键。**读哪几个键是插件自己的事** ——
+plugin-kit 里 `Definition.configKeys` 就是插件对这件事的声明，initialize 时它把
+`config` 里多出来的键按 §4.4 记一条 warn（只要有一条就报，只报不拦: 配置可能比插件
+新，那是升级顺序，不是错误）。不声明 `configKeys` = 整个跳过检查。
+
 你必须在 `initialize_timeout_ms`（默认 5000，可在 `[plugins.<id>]` 里覆盖）内回复。超时 = 启动失败。
 
 result 必须包含:
@@ -453,7 +458,8 @@ result 是 `{}`。
 ## 6. 能力调用与路由
 
 - 能力 id 是**不透明字符串**。内核不知道 `"demo.text"` 是什么意思，只知道它归哪个插件、版本多少。名字由你和写配置的人约定。
-- 路由表来自两处交叉校验: 配置文件里的 `[capability]` 槽（能力 id -> 插件 id）和插件 `initialize` 时声明的 `provides`。槽必须被它指向的插件真的提供，否则启动失败。
+- 路由表由插件的 `provides` 推导: 你在 `initialize` 里声明了哪些能力，配置里就自动有哪些槽，不必在配置文件中再抄一遍。声明了就是可调的 —— 要下线一个能力，把提供它的插件从配置里去掉。
+- `[capability]` 只在有歧义时用: 两个被配置的插件声明同一个能力时报错，那一条 pin（能力 id -> 插件 id）指明由谁提供；pin 指向一个不提供该能力的插件同样启动失败。
 - 一个能力 id 只有一个提供方。没有优先级、没有故障转移、没有负载均衡 —— 要换提供方就改配置（或热重载）。
 - 热重载时**整张表被替换**（不是改单条路由），插件通过 `kernel.capabilities.changed` 拿到新表。这意味着: 永远用能力 id 发起调用，不要在本地缓存"哪个插件"，那样在重载后会指向旧世界。
 - 调用方标签由内核写死，调用方自己说的不算: 插件调用时是插件 id，宿主调用时是 `"host"`。你不能冒充别的调用方。
@@ -616,7 +622,7 @@ result 是 `{}`。
 
 ### 8.6 热重载与事件
 
-配置文件的变更被接受时，内核会发 `kernel.capabilities.changed`（带整张新表）和 `kernel.config.reloaded`。重载过程中**内核自己不重启**；新增或改动的插件被拉起来、重新 `initialize` + `start`，被替换掉的插件在 drain 之后收到 `shutdown{reason:"reload"}`。重载失败（新配置坏了）会被整体回滚并继续用旧配置跑，你只会看到一条日志，不会有事件。
+配置文件的变更被接受时（哪一层都算，见 §12.4），内核会发 `kernel.capabilities.changed`（带整张新表）和 `kernel.config.reloaded`。重载过程中**内核自己不重启**；新增或改动的插件被拉起来、重新 `initialize` + `start`，被替换掉的插件在 drain 之后收到 `shutdown{reason:"reload"}`。重载失败（新配置坏了）会被整体回滚并继续用旧配置跑，你只会看到一条日志，不会有事件。
 
 ---
 
@@ -745,7 +751,7 @@ result 是 `{}`。
 [plugins.demo]
 command = "node"                    # 裸名字 → 交给操作系统在 PATH 上找
 args = ["plugins/minimal-plugin.js"]
-# cwd 缺省是配置文件所在目录
+# cwd 缺省是入口配置文件所在目录（见 §12.4）
 # env = { API_KEY = "${TOKEN}" }    # ${VAR} 会展开；变量没设是硬错误
 # clear_env = true                  # 清空继承来的环境变量
 # request_timeout_ms = 1000         # 别人调我时的默认超时
@@ -753,11 +759,11 @@ args = ["plugins/minimal-plugin.js"]
 [plugins.demo.config]               # 原样出现在 initialize 的 params.config 里
 greeting = "hi"
 
-[capability]
-"demo.text" = "demo"                # 能力槽 → 插件 id；必须被该插件的 provides 覆盖
+# [capability]                     # 只在两个插件抢同一个能力时才需要写
+# "demo.text" = "demo"             # 那一条 pin：这个能力由谁提供（见 §6）
 ```
 
-- `command` 里**带路径分隔符**时按配置文件所在目录解析；**裸名字**留给 PATH（所以 `node` / `python` / `deno` 直接写）。
+- `command` 里**带路径分隔符**时按入口配置文件所在目录解析；**裸名字**留给 PATH（所以 `node` / `python` / `deno` 直接写）。
 - `args` 也会做 `${VAR}` 展开，但不会被当成路径解析。
 - `${VAR}` 未定义是**硬错误**（宁可拒绝启动，也不要静默变成空串）; `$$` 表示一个字面 `$`; 展开**不递归**。
 - 插件 id 不能是 `host`（保留给宿主）。
@@ -874,6 +880,28 @@ args = ["minimal-plugin.mjs"]
 - `shutdown` 的四种 reason 行为一致，且真能退出去。
 - 日志走 `kernel.log` 或 stderr，不走 stdout。
 
+### 12.4 配置文件可以分层（`extends`）
+
+一个配置文件可以用 `extends` 列出它叠在哪些文件之上:
+
+```toml
+extends = ["eggshell.base.toml", "team.toml"]   # 先加载，按这个顺序
+```
+
+- **列出的文件必须都在**。缺一个就启动失败并说出读不到哪个文件 —— 拼错文件名立刻可见，不会退化成"少了一层但看起来正常"。
+- 相对路径按**写它的那个文件**所在目录解析；绝对路径照写。
+- 后加载的层赢。同一个键谁后写谁算；**表逐键合并**（`[plugins.api.config]` 只覆盖它提到的那些键，其余的从下面那层活下来），**数组和标量整体替换**。所以一层可以只有一个键。
+- 相对 `command` / `cwd` 按**你启动时给的那个文件**（入口层）所在目录解析，不是按声明它的那一层。层放在别的目录时，用绝对路径说清楚。
+- 一个文件被走到两次（菱形依赖，或者绕回来）只算一次，位置取它第一次出现的地方。层栈总是有限，顺序稳定。
+- `--check` 会打印这次到底由哪几个文件组成，基础层在前、入口在后:
+
+  ```
+  config: eggshell.toml + eggshell.local.toml
+  ```
+
+- 热重载盯的是**整摞层**: 改入口 `extends` 的某个文件，和改入口本身一样会触发重载。
+- `extends` 属于文件机制，不是插件配置: 它不会出现在任何插件的 `config` 里，而从一段字符串加载（没有文件可解析）时写 `extends` 是硬错误。插件看到的永远是合并、解析完的结果。
+
 ---
 
 ## 13. 版本与兼容
@@ -892,10 +920,12 @@ args = ["minimal-plugin.mjs"]
 ### 14.1 怎么起
 
 ```
-eggshell <config.toml>
+eggshell <config.toml> [--check] [--json]
 ```
 
 这个可执行文件只在 `--features host` 构建时产出。默认构建不产出任何可执行文件（测试替身除外，见 12.2）。
+
+`--check` 是配置体检: 拉起每个插件、`initialize` 一遍、校验能力图和版本范围、算出启动顺序，然后打印报告退出（0 = 通过，1 = 有 error）。它**从不发 `start`**、不碰 io、不发任何生命周期事件，所以不联网、没有副作用 —— 改完配置先跑这个，比开一次真对话快得多。报告写 stdout（体检模式下那个 fd 不是协议管道），字段和启动失败时 stderr 上那份一致；`--json` 把同一份报告打成一行 JSON 而不是文本。
 
 ```
 宿主 → 内核 fd 0    宿主发的帧（请求）

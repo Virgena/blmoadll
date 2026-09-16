@@ -2,7 +2,7 @@
 name = "eggshell-loader"
 version.workspace = true
 edition.workspace = true
-description = "Turns an eggshell.toml into the plugin set the kernel boots"
+description = "Turns config files into the plugin set the kernel boots"
 
 [dependencies]
 serde.workspace = true

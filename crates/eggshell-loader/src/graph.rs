@@ -113,12 +113,18 @@ pub fn satisfies(range: &str, version: &str) -> Result<bool, String> {
     Ok(req.matches(&ver))
 }
 
-/// Cross-checks config against plugin declarations.
-pub fn validate(decls: &[Decl], capability: &BTreeMap<String, String>) -> Report {
+/// Cross-checks config against plugin declarations and builds the routing table.
+///
+/// A configured plugin's `provides` is the whole story: every capability a
+/// plugin declares becomes routable, so the config file never has to restate
+/// it. `pins` only speaks up when two configured plugins offer the same
+/// capability and one of them has to win.
+pub fn validate(decls: &[Decl], pins: &BTreeMap<String, String>) -> Report {
     let mut report = Report::default();
     let by_id: BTreeMap<&str, &Decl> = decls.iter().map(|d| (d.id.as_str(), d)).collect();
 
-    for (slot, plugin) in capability {
+    // A pin wins, and it has to name a plugin that really offers the slot.
+    for (slot, plugin) in pins {
         let Some(decl) = by_id.get(plugin.as_str()) else {
             report.errors.push(
                 Issue::error(
@@ -159,6 +165,46 @@ pub fn validate(decls: &[Decl], capability: &BTreeMap<String, String>) -> Report
                 );
             }
         }
+    }
+
+    // Nothing pinned: derive. One provider per capability needs no decision,
+    // two need the config to say which one.
+    let mut offered: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+    for decl in decls {
+        for (cap, version) in &decl.provides {
+            offered
+                .entry(cap.as_str())
+                .or_default()
+                .push((decl.id.as_str(), version.as_str()));
+        }
+    }
+    for (cap, providers) in &offered {
+        if pins.contains_key(*cap) {
+            continue;
+        }
+        if providers.len() == 1 {
+            let (id, version) = providers[0];
+            report.table.insert(
+                cap.to_string(),
+                Route { plugin: id.to_string(), version: version.to_string() },
+            );
+            continue;
+        }
+        let names = providers
+            .iter()
+            .map(|(id, _)| format!("`{id}`"))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        report.errors.push(
+            Issue::error(
+                codes::INVALID_CONFIG,
+                format!(
+                    "`{cap}` is offered by {names}; add capability.\"{cap}\" = \"{}\" to pick one",
+                    providers[0].0
+                ),
+            )
+            .at(format!("capability.{cap}")),
+        );
     }
 
     for decl in decls {
@@ -224,7 +270,8 @@ pub fn validate(decls: &[Decl], capability: &BTreeMap<String, String>) -> Report
     for slot in report.table.keys() {
         if !used.contains(slot) {
             report.warnings.push(Issue::warning(format!(
-                "capability slot `{slot}` is configured but no plugin requires it"
+                "capability slot `{slot}` is configured but no plugin requires it \
+                 (expected when the host is the only caller)"
             )));
         }
     }
@@ -500,6 +547,37 @@ mod tests {
         let report = validate(&decls, &slots(&[("cap.x", "solo")]));
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(start_order(&decls, &report.table).unwrap(), vec!["solo"]);
+    }
+
+    #[test]
+    fn derives_routes_from_provides_without_any_capability_table() {
+        let decls = vec![
+            decl("provider", &[("demo.text", "1.0.0")], &[]),
+            decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^1", false)]),
+        ];
+        let report = validate(&decls, &BTreeMap::new());
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.table["demo.text"].plugin, "provider");
+        assert_eq!(report.table["demo.loop"].plugin, "consumer");
+        assert_eq!(start_order(&decls, &report.table).unwrap(), vec!["provider", "consumer"]);
+    }
+
+    #[test]
+    fn two_providers_of_one_capability_need_a_pin() {
+        let decls = vec![
+            decl("a", &[("demo.text", "1.0.0")], &[]),
+            decl("b", &[("demo.text", "1.0.0")], &[]),
+        ];
+        let report = validate(&decls, &BTreeMap::new());
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        let message = &report.errors[0].message;
+        assert!(message.contains("`a`") && message.contains("`b`"), "{message}");
+        assert!(message.contains("capability.\"demo.text\""), "{message}");
+        assert_eq!(report.errors[0].field.as_deref(), Some("capability.demo.text"));
+
+        let pinned = validate(&decls, &slots(&[("demo.text", "b")]));
+        assert!(pinned.errors.is_empty(), "{pinned:?}");
+        assert_eq!(pinned.table["demo.text"].plugin, "b");
     }
 }
 
