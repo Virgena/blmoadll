@@ -72,6 +72,17 @@ async fn main() -> ExitCode {
             Ok(None) | Err(_) => return ExitCode::SUCCESS,
             Ok(Some(payload)) => {
                 let Ok(incoming) = proto::parse_frame(&payload) else { continue };
+                // Notifications are not requests, so they cannot go through the
+                // match below - but the test double still says what it heard, on
+                // stderr, where the kernel's log picks it up: that is how the
+                // process-level tests prove a cancel reached a provider.
+                if let Incoming::Notification { method, params } = &incoming {
+                    if method.as_str() == proto::method::CANCEL {
+                        let id = params.get("request_id").map(|value| value.to_string()).unwrap_or_default();
+                        eprintln!("fixture: cancelled request={id}");
+                    }
+                    continue;
+                }
                 let Incoming::Request { id, method, params } = incoming else { continue };
                 match method.as_str() {
                     proto::method::INITIALIZE => {
@@ -96,6 +107,10 @@ async fn main() -> ExitCode {
                         }
                     }
                     proto::method::SHUTDOWN => {
+                        // The reason the kernel was given, echoed on stderr: the
+                        // same way the tests see which reason a host really sent.
+                        let reason = params.get("reason").and_then(Value::as_str).unwrap_or("?");
+                        eprintln!("fixture: shutdown reason={reason}");
                         send(&mut out, &proto::success(id, json!({}))).await;
                         return ExitCode::SUCCESS;
                     }

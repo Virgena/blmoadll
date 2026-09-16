@@ -16,6 +16,7 @@ libc = { workspace = true }
 
 [features]
 fixture = []
+host = []
 
 [[bin]]
 name = "eggshell-fixture"
@@ -26,3 +27,13 @@ required-features = ["fixture"]
 name = "host"
 path = "tests/host.rs"
 required-features = ["fixture"]
+
+[[bin]]
+name = "eggshell"
+path = "src/bin/eggshell.rs"
+required-features = ["host"]
+
+[[test]]
+name = "host_process"
+path = "tests/host_process.rs"
+required-features = ["fixture", "host"]

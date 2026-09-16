@@ -93,6 +93,10 @@ struct State {
     inflight_total: usize,
     /// `--check` runs a lifecycle without lifecycle events and without `start`.
     check_mode: bool,
+    /// The embedder talks to the kernel over a pipe, so the terminal - and with
+    /// it the io primitives - belongs to the embedder. Claiming fd 0/1 here
+    /// would corrupt the host protocol.
+    host_mode: bool,
 }
 
 pub struct Kernel {
@@ -215,6 +219,19 @@ impl Kernel {
         self.state.lock().unwrap().config.limits.clone()
     }
 
+    fn host_mode(&self) -> bool {
+        self.state.lock().unwrap().host_mode
+    }
+
+    /// This kernel is somebody's subprocess: fd 0 and fd 1 are the host
+    /// protocol, so there is no terminal left for a plugin to claim.
+    fn no_terminal(name: &str) -> RpcError {
+        RpcError::new(
+            codes::METHOD_NOT_FOUND,
+            format!("{name} is not available: the kernel runs as a host subprocess, so its terminal belongs to the host"),
+        )
+    }
+
     fn budget(&self) -> Budget {
         let kernel = self.cfg();
         Budget { len: kernel.event_queue_len, bytes: kernel.event_queue_bytes }
@@ -290,8 +307,20 @@ impl Kernel {
 
     // ----------------------------------------------------------------- boot
 
+    /// Boots a kernel for an embedder that lives in this process: it keeps the
+    /// terminal, so `kernel.attach` and `kernel.write` work.
     pub async fn boot(config: Config, check: bool) -> Result<Arc<Kernel>, Report> {
-        let kernel = Arc::new(Kernel::assemble(config, check));
+        Kernel::boot_in(config, check, false).await
+    }
+
+    /// Boots a kernel for an embedder that talks to it over a pipe. The io
+    /// primitives are refused there: fd 0 and fd 1 carry the host protocol.
+    pub async fn boot_host(config: Config) -> Result<Arc<Kernel>, Report> {
+        Kernel::boot_in(config, false, true).await
+    }
+
+    async fn boot_in(config: Config, check: bool, host: bool) -> Result<Arc<Kernel>, Report> {
+        let kernel = Arc::new(Kernel::assemble(config, check, host));
         kernel.clone().start_processes().await?;
 
         let mut report = Report::default();
@@ -419,7 +448,7 @@ impl Kernel {
         Ok(kernel)
     }
 
-    fn assemble(config: Config, check: bool) -> Kernel {
+    fn assemble(config: Config, check: bool, host: bool) -> Kernel {
         let mut plugins = BTreeMap::new();
         for (id, cfg) in &config.plugins {
             plugins.insert(
@@ -470,6 +499,7 @@ impl Kernel {
                 last_activity: Instant::now(),
                 inflight_total: 0,
                 check_mode: check,
+                host_mode: host,
             }),
             attached,
             shutdown_tx,
@@ -1225,6 +1255,9 @@ impl Kernel {
     // ------------------------------------------------------------------- io
 
     fn attach(&self, plugin: &str, params: &Value) -> Result<Value, RpcError> {
+        if self.host_mode() {
+            return Err(Self::no_terminal(method::KERNEL_ATTACH));
+        }
         let stream = str_field(params, "stream");
         let mode = params.get("mode").and_then(Value::as_str).unwrap_or("line").to_string();
         {
@@ -1261,6 +1294,9 @@ impl Kernel {
     }
 
     fn detach(&self, plugin: &str, params: &Value) -> Result<Value, RpcError> {
+        if self.host_mode() {
+            return Err(Self::no_terminal(method::KERNEL_DETACH));
+        }
         {
             let mut state = self.state.lock().unwrap();
             match str_field(params, "stream").as_str() {
@@ -1293,6 +1329,9 @@ impl Kernel {
     }
 
     fn write(&self, params: &Value) -> Result<Value, RpcError> {
+        if self.host_mode() {
+            return Err(Self::no_terminal(method::KERNEL_WRITE));
+        }
         if str_field(params, "stream") != "stdout" {
             return Err(RpcError::new(codes::INVALID_PARAMS, "kernel.write only writes to stdout"));
         }
@@ -2016,6 +2055,13 @@ impl Host {
 }
 
 impl Kernel {
+    /// The routing table as `start` hands it to a plugin: capability id ->
+    /// `{plugin, version}`. A host has no snapshot of its own, so this is how it
+    /// learns what exists before any event arrives.
+    pub fn capabilities(&self) -> Value {
+        to_json(&self.state.lock().unwrap().table)
+    }
+
     /// Takes the embedder's end. `None` after the first call.
     pub fn host(&self) -> Option<Host> {
         self.host.lock().unwrap().take()
@@ -2124,6 +2170,22 @@ impl Kernel {
     /// Runs the unified shutdown flow, exactly as a plugin's `kernel.shutdown`
     /// would. The embedder is the UI as far as a plugin can tell, hence `ui_quit`.
     pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(proto::reason::UI_QUIT);
+        self.shutdown_with(proto::reason::UI_QUIT);
+    }
+
+    /// The same flow, with the reason the plugins will be told. The vocabulary
+    /// lives at the protocol surface (`reason::*`), not here: an embedder that
+    /// only ever says `ui_quit` calls `shutdown`.
+    pub fn shutdown_with(&self, reason: &'static str) {
+        let _ = self.shutdown_tx.send(reason);
+    }
+
+    /// The embedder gives up one of its own streams or calls. The params are the
+    /// wire shape (7.6): `{stream_id}` or `{request_id}`. Cancellation is
+    /// cooperative and silent - the kernel stops forwarding and tells the
+    /// provider, and the caller gets no terminal frame. An id nobody knows is a
+    /// no-op, so cancelling twice is harmless.
+    pub fn cancel(&self, params: &Value) {
+        self.on_cancel(HOST, params);
     }
 }
