@@ -64,6 +64,8 @@ impl std::fmt::Display for ConfigError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPlugin {
+    #[serde(default)]
+    disabled: bool,
     command: String,
     #[serde(default)]
     args: Vec<String>,
@@ -123,6 +125,9 @@ pub struct Config {
     /// needed to break a tie when two configured plugins offer the same
     /// capability. Slots nobody requires are allowed.
     pub capability: BTreeMap<String, String>,
+    /// Plugin ids whose merged row says `disabled = true`. They are not in
+    /// `plugins`, but a `[capability]` pin or a report can still name them.
+    pub disabled: BTreeSet<String>,
 }
 
 impl Config {
@@ -171,7 +176,12 @@ impl Config {
         let dir = parent_dir(path);
 
         let mut plugins = BTreeMap::new();
+        let mut disabled = BTreeSet::new();
         for (id, plugin) in &raw.plugins {
+            if plugin.disabled {
+                disabled.insert(id.clone());
+                continue;
+            }
             plugins.insert(id.clone(), plugin.resolve(id, &dir, env)?);
         }
 
@@ -183,7 +193,7 @@ impl Config {
             )));
         }
         if plugins.is_empty() {
-            return Err(ConfigError::new("no [plugins.<id>] entries configured"));
+            return Err(ConfigError::new("no enabled [plugins.<id>] entries configured"));
         }
 
 
@@ -202,6 +212,7 @@ impl Config {
             limits,
             plugins,
             capability: raw.capability.clone(),
+            disabled,
         })
     }
 
@@ -535,7 +546,7 @@ prefix = "echo: "
         assert!(err.message.contains("missing field `command`"), "{}", err.message);
 
         let err = Config::parse("", Path::new("c.toml"), &env).unwrap_err();
-        assert!(err.message.contains("no [plugins"), "{}", err.message);
+        assert!(err.message.contains("no enabled [plugins"), "{}", err.message);
     }
 
     #[test]
@@ -598,6 +609,33 @@ model = "good"
         assert_eq!(config.sources, vec![base, local]);
     }
 
+    #[test]
+    fn a_disabled_row_is_configured_but_never_resolved() {
+        let dir = scratch("disabled");
+        let base = write(
+            &dir.join("base.toml"),
+            r#"
+[plugins.on]
+command = "node"
+
+[plugins.off]
+disabled = true
+command = "node"
+"#,
+        );
+
+        let config = Config::load(&base, &env_of(&[])).unwrap();
+        assert_eq!(config.plugins.keys().collect::<Vec<_>>(), vec!["on"]);
+        assert_eq!(config.disabled.iter().collect::<Vec<_>>(), vec!["off"]);
+
+        let local = write(
+            &dir.join("local.toml"),
+            "extends = [\"base.toml\"]\n[plugins.off]\ndisabled = false\n",
+        );
+        let config = Config::load(&local, &env_of(&[])).unwrap();
+        assert_eq!(config.plugins.keys().collect::<Vec<_>>(), vec!["off", "on"]);
+        assert!(config.disabled.is_empty());
+    }
     #[test]
     fn arrays_are_replaced_whole_rather_than_joined() {
         let dir = scratch("arrays");

@@ -1,11 +1,19 @@
-# 文档约定
+# Documentation conventions
 
-## 不使用装饰性图标
+## No decorative icons
 
-文档不用 emoji / 图标(🔒 ✅ ⚠️ 🟢 等)—— 它们在不同操作系统 / 字体下渲染不一致,反而降低可读性
+Documents do not use emoji or icons (locks, check marks, warning signs, coloured dots, and so on): they render differently across operating systems and fonts, which hurts readability instead of helping it.
 
-一切用文字说清楚:
-状态 / 结果用词:是 / 否、支持 / 不支持、已完成 / 进行中 / 未做、正常 / 异常、高 / 中 / 低。
-表格状态列写文字,不用 ✅ / ❌ / 🟢 / 🔴;需要图例就写文字图例。
-提示 / 警告用文字标签:「注意:」「重要:」「已实现:」等,不用 emoji 前缀。
-可保留(等宽渲染一致、属结构而非装饰):ASCII 制表符 ┌─┘├、几何箭头 ▲ ► ▼、圈号步骤 ① ② ③、纯文本箭头 → ← ↓、键盘快捷键写文字(如 Cmd+K)
+Say everything in words:
+
+- States and results use words: yes / no, supported / unsupported, done / in progress / not started, healthy / failing, high / medium / low.
+- A status column spells the state out rather than using a check, a cross or a coloured dot; when a legend is needed, write the legend in words.
+- Notes and warnings use a text label ("Note:", "Important:", "Implemented:") instead of an emoji prefix.
+- Allowed, because they render consistently in a monospace font and are structure rather than decoration: ASCII box drawing (┌─┘├), geometric arrows (▲ ► ▼), circled step numbers (① ② ③), plain-text arrows (→ ← ↓), and keyboard shortcuts written out (such as Cmd+K).
+
+## No em dashes
+
+Never use an em dash or an en dash in prose, in either language.
+
+- Introduce an explanation with a colon, separate clauses with a comma or a semicolon, and put an aside in parentheses.
+- Hyphens in code, flags, file names, and compound words are unaffected.

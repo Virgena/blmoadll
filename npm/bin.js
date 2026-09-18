@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// pnpm/npm 的 .bin/eggshell 走这里，参数原样转给内核。
+// pnpm/npm's .bin/eggshell lands here; arguments are passed through to the kernel.
 import { spawnSync } from "node:child_process";
 
 import { kernel } from "./index.js";

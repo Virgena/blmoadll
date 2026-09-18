@@ -21,6 +21,9 @@ const EGGSHELL: &str = env!("CARGO_BIN_EXE_eggshell");
 const FIXTURE: &str = env!("CARGO_BIN_EXE_eggshell-fixture");
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const PATIENCE: Duration = Duration::from_secs(15);
+/// The reloader polls on its own interval, so a propagated change is an
+/// "eventually": this is the budget for it, on purpose far above PATIENCE.
+const RELOAD_PATIENCE: Duration = Duration::from_secs(60);
 
 fn scratch(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("eggshell-pipe-{name}-{}", std::process::id()));
@@ -136,12 +139,16 @@ impl HostProcess {
         id
     }
 
+    /// One frame. Never race this against a shorter timeout: dropping a read
+    /// mid-flight loses bytes on a pipe, and every later frame is misparsed.
     async fn recv(&mut self) -> Value {
-        let payload = tokio::time::timeout(PATIENCE, read_frame(&mut self.stdout, MAX_FRAME_BYTES))
-            .await
-            .expect("the kernel went quiet")
-            .expect("frame")
-            .expect("the kernel closed its stdout");
+        let outcome = tokio::time::timeout(PATIENCE, read_frame(&mut self.stdout, MAX_FRAME_BYTES)).await;
+        let payload = match outcome {
+            Ok(Ok(Some(payload))) => payload,
+            Ok(Err(error)) => panic!("bad frame {error:?}; logs: {}", self.logs()),
+            Ok(Ok(None)) => panic!("the kernel closed its stdout; logs: {}", self.logs()),
+            Err(_) => panic!("the kernel went quiet; logs: {}", self.logs()),
+        };
         serde_json::from_slice(&payload).expect("a frame the host can parse")
     }
 
@@ -192,6 +199,17 @@ impl HostProcess {
         self.reply(&id).await;
         self.exit().await
     }
+}
+/// Waits for one line of the kernel's own log, with the reload budget.
+async fn wait_for_log(kernel: &HostProcess, needle: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + RELOAD_PATIENCE;
+    while tokio::time::Instant::now() < deadline {
+        if kernel.logs().contains(needle) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 #[tokio::test]
 async fn the_pipe_carries_a_capability_call() {
@@ -324,13 +342,14 @@ async fn closing_the_host_pipe_is_a_goodbye() {
 #[tokio::test]
 async fn a_config_that_cannot_boot_exits_one_with_a_report() {
     let dir = scratch("bad-config");
-    // "demo.text" is routed to a plugin the config never declared.
+    // "demo.other" is pinned to a plugin that does not provide it.
     let path = config(&dir, &format!(r#"
 [plugins.provider]
 command = '{FIXTURE}'
+args = ["--provides", "demo.text=1.0.0"]
 
 [capability]
-"demo.other" = "nobody"
+"demo.other" = "provider"
 "#));
     let output = Command::new(EGGSHELL)
         .arg(&path)
@@ -540,6 +559,44 @@ args = ["--provides", "demo.more=1.0.0"]
 /// The reloader watches the whole stack: editing a file *underneath* the entry
 /// is a config change like any other.
 #[tokio::test]
+async fn a_layer_that_changed_while_being_written_is_still_reloaded() {
+    let dir = scratch("layers-partial");
+    let base = dir.join("base.toml");
+    let row = |provides: &str| {
+        format!(
+            r#"
+[plugins.provider]
+command = '{FIXTURE}'
+args = ["--provides", "{provides}"]
+"#
+        )
+    };
+    std::fs::write(&base, row("demo.text=1.0.0")).expect("write the base layer");
+    let local = dir.join("local.toml");
+    std::fs::write(&local, "extends = [\"base.toml\"]\n").expect("write the entry layer");
+
+    let mut kernel = HostProcess::spawn(&local).await;
+    let id = kernel.request("capabilities", json!({})).await;
+    assert_eq!(kernel.reply(&id).await["result"]["demo.text"]["version"], json!("1.0.0"));
+
+    std::fs::write(&base, "[plugins.").expect("truncate half a row");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    std::fs::write(&base, row("demo.more=2.0.0")).expect("finish the write");
+
+    assert!(
+        wait_for_log(&kernel, "reload applied").await,
+        "the reloader never saw the finished file:\n{}",
+        kernel.logs()
+    );
+
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.more", "method": "echo", "params": {"hi": 2}}))
+        .await;
+    assert_eq!(kernel.reply(&id).await["result"]["got"]["hi"], json!(2));
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+#[tokio::test]
 async fn editing_a_base_layer_reloads_the_running_kernel() {
     let dir = scratch("layers-reload");
     let base = dir.join("base.toml");
@@ -572,15 +629,11 @@ args = ["--provides", "demo.more=1.0.0"]
     );
     std::fs::write(&base, body(&extra)).expect("rewrite the base layer");
 
-    let mut reloaded = false;
-    for _ in 0..160 {
-        if kernel.logs().contains("reload applied") {
-            reloaded = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(reloaded, "the reloader never saw the base layer change:\n{}", kernel.logs());
+    assert!(
+        wait_for_log(&kernel, "reload applied").await,
+        "the reloader never saw the base layer change:\n{}",
+        kernel.logs()
+    );
 
     // The new row is live, which is the half a "reload applied" log cannot show.
     let id = kernel
@@ -591,6 +644,439 @@ args = ["--provides", "demo.more=1.0.0"]
         .await;
     let reply = kernel.reply(&id).await;
     assert_eq!(reply["result"]["got"]["hi"], json!(1), "{reply}");
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+
+
+/// A `disabled` row is configured but not started: no process, no capability,
+/// no `started`. Flipping it back on is an ordinary config change the reloader
+/// picks up, and it announces itself with a `config` trigger.
+#[tokio::test]
+async fn a_disabled_row_waits_for_the_config_to_enable_it() {
+    let dir = scratch("disabled");
+    let path = dir.join("eggshell.toml");
+    let body = |disabled: &str| {
+        format!(
+            r#"
+[plugins.keep]
+command = '{FIXTURE}'
+args = ["--provides", "demo.keep=1.0.0"]
+
+[plugins.provider]
+disabled = {disabled}
+command = '{FIXTURE}'
+args = ["--provides", "demo.text=1.0.0"]
+"#
+        )
+    };
+    std::fs::write(&path, body("true")).expect("write the config");
+
+    let mut kernel = HostProcess::spawn(&path).await;
+    let id = kernel.request("capabilities", json!({})).await;
+    let reply = kernel.reply(&id).await;
+    assert_eq!(reply["result"]["demo.keep"]["plugin"], json!("keep"));
+    assert!(reply["result"]["demo.text"].is_null(), "{reply}");
+
+    let sub = kernel.request("subscribe", json!({"patterns": ["kernel.plugin.started"]})).await;
+    assert!(kernel.reply(&sub).await["result"]["subscription_id"].is_string());
+
+    std::fs::write(&path, body("false")).expect("enable the row");
+
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut started: Option<Value> = None;
+    while started.is_none() && tokio::time::Instant::now() < deadline {
+        let frame = kernel.recv().await;
+        if frame["params"]["topic"] == json!("kernel.plugin.started") {
+            started = Some(frame);
+        }
+    }
+    let started = started.expect("the enabled row should come up on reload");
+    assert_eq!(started["params"]["payload"]["plugin"], json!("provider"));
+    assert_eq!(started["params"]["payload"]["trigger"], json!("config"));
+
+    let id = kernel
+        .request(
+            "invoke",
+            json!({"capability": "demo.text", "method": "echo", "params": {"hi": 7}}),
+        )
+        .await;
+    assert_eq!(kernel.reply(&id).await["result"]["got"]["hi"], json!(7));
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+/// One notification out of a batch, by topic.
+fn topic<'a>(events: &'a [Value], name: &str) -> &'a Value {
+    events
+        .iter()
+        .find(|event| event["params"]["topic"] == json!(name))
+        .unwrap_or_else(|| panic!("no {name} among {events:?}"))
+}
+
+/// A host can point at one plugin and ask for it back: the old process goes, a
+/// fresh one takes over, and the events say who asked and where it came from.
+#[tokio::test]
+async fn restart_brings_a_plugin_back_under_a_new_pid() {
+    let dir = scratch("restart");
+    let path = config(&dir, &one_provider("demo.text=1.0.0", ""));
+    let mut kernel = HostProcess::spawn(&path).await;
+    let sub = kernel
+        .request("subscribe", json!({"patterns": ["kernel.plugin.*", "kernel.capabilities.changed"]}))
+        .await;
+    assert!(kernel.reply(&sub).await["result"]["subscription_id"].is_string());
+
+    let first = kernel.request("restart", json!({"plugin": "provider", "reason": "source"})).await;
+    let (reply, events) = kernel.reply_and(&first, "$/event", 3).await;
+    assert_eq!(reply["result"], json!({}), "{reply}");
+
+    let started = topic(&events, "kernel.plugin.started");
+    assert_eq!(started["params"]["payload"]["trigger"], json!("source"));
+    let cwd = started["params"]["payload"]["cwd"].as_str().unwrap_or_default();
+    assert!(!cwd.is_empty(), "{started}");
+    let command = started["params"]["payload"]["command"].as_str().unwrap_or_default();
+    assert!(command.contains("eggshell-fixture"), "{started}");
+    assert_eq!(started["params"]["payload"]["args"], json!(["--provides", "demo.text=1.0.0"]));
+
+    let stopped = topic(&events, "kernel.plugin.stopped");
+    assert_eq!(stopped["params"]["payload"]["reason"], json!("shutdown"));
+    assert_eq!(stopped["params"]["payload"]["trigger"], json!("source"));
+
+    let second = kernel.request("restart", json!({"plugin": "provider"})).await;
+    let (reply, events) = kernel.reply_and(&second, "$/event", 3).await;
+    assert_eq!(reply["result"], json!({}), "{reply}");
+    let again = topic(&events, "kernel.plugin.started");
+    assert_eq!(again["params"]["payload"]["trigger"], json!("manual"));
+    assert_ne!(again["params"]["payload"]["pid"], started["params"]["payload"]["pid"]);
+
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.text", "method": "echo", "params": {"hi": 2}}))
+        .await;
+    let reply = kernel.reply(&id).await;
+    assert_eq!(reply["result"]["got"]["hi"], json!(2), "{reply}");
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+
+#[tokio::test]
+async fn a_late_subscriber_can_ask_for_the_running_plugins() {
+    let dir = scratch("replay");
+    let path = config(&dir, &one_provider("demo.text=1.0.0", ""));
+    let mut kernel = HostProcess::spawn(&path).await;
+    let sub = kernel
+        .request("subscribe", json!({"patterns": ["kernel.plugin.started"], "replay": true}))
+        .await;
+    let (reply, events) = kernel.reply_and(&sub, "$/event", 1).await;
+    assert!(reply["result"]["subscription_id"].is_string());
+
+    let started = topic(&events, "kernel.plugin.started");
+    assert_eq!(started["params"]["payload"]["plugin"], json!("provider"));
+    assert_eq!(started["params"]["payload"]["trigger"], json!("boot"));
+    assert!(started["params"]["payload"]["cwd"].is_string());
+    let command = started["params"]["payload"]["command"].as_str().unwrap_or_default();
+    assert!(command.contains("eggshell-fixture"), "{started}");
+    assert_eq!(started["params"]["payload"]["args"], json!(["--provides", "demo.text=1.0.0"]));
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+
+/// A plugin that cannot come back is refused with -32011 and marked absent, and
+/// the host can simply ask again once the reason is gone.
+#[tokio::test]
+async fn a_restart_that_cannot_come_up_is_refused_and_can_be_retried() {
+    let dir = scratch("restart-refused");
+    let marker = dir.join("broken");
+    let path = config(&dir, &one_provider("demo.text=1.0.0", r#", "--exit-if", "broken""#));
+    let mut kernel = HostProcess::spawn(&path).await;
+
+    let first = kernel.request("restart", json!({"plugin": "provider"})).await;
+    assert_eq!(kernel.reply(&first).await["result"], json!({}));
+
+    std::fs::write(&marker, b"broken\n").expect("write the marker");
+    let refused = kernel.request("restart", json!({"plugin": "provider"})).await;
+    let reply = kernel.reply(&refused).await;
+    assert_eq!(reply["error"]["code"], json!(-32011), "{reply}");
+    assert_eq!(reply["error"]["data"]["plugin"], json!("provider"));
+    assert!(kernel.saw_log("restart rejected").await, "{}", kernel.logs());
+
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.text", "method": "echo", "params": {}}))
+        .await;
+    assert_eq!(kernel.reply(&id).await["error"]["code"], json!(-32011));
+
+    std::fs::remove_file(&marker).expect("remove the marker");
+    let retry = kernel.request("restart", json!({"plugin": "provider"})).await;
+    assert_eq!(kernel.reply(&retry).await["result"], json!({}));
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.text", "method": "echo", "params": {"hi": 3}}))
+        .await;
+    assert_eq!(kernel.reply(&id).await["result"]["got"]["hi"], json!(3));
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+
+/// The two ways to name nothing: a plugin id the config never had, a reason the
+/// kernel does not know, and an empty request.
+#[tokio::test]
+async fn restart_rejects_an_unknown_plugin_or_reason() {
+    let dir = scratch("restart-bad");
+    let path = config(&dir, &one_provider("demo.text=1.0.0", ""));
+    let mut kernel = HostProcess::spawn(&path).await;
+
+    for params in [
+        json!({"plugin": "nope"}),
+        json!({"plugin": "provider", "reason": "because"}),
+        json!({}),
+    ] {
+        let id = kernel.request("restart", params.clone()).await;
+        let reply = kernel.reply(&id).await;
+        assert_eq!(reply["error"]["code"], json!(-32602), "{params}: {reply}");
+    }
+
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.text", "method": "echo", "params": {"hi": 4}}))
+        .await;
+    assert_eq!(kernel.reply(&id).await["result"]["got"]["hi"], json!(4));
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+/// One `$/event` whose topic and payload match, or a panic after `PATIENCE`.
+async fn event_where(
+    kernel: &mut HostProcess,
+    topic_name: &str,
+    matches: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no {topic_name} event showed up"
+        );
+        let frame = kernel.recv().await;
+        if frame["params"]["topic"] == json!(topic_name) && matches(&frame["params"]["payload"]) {
+            return frame;
+        }
+    }
+}
+
+/// The two rows: a provider behind the `disabled` switch, and a consumer that
+/// needs it.
+fn waiting_pair() -> String {
+    format!(
+        r#"
+[plugins.provider]
+disabled = {{disabled}}
+command = '{FIXTURE}'
+args = ["--provides", "demo.text=1.0.0"]
+
+[plugins.waiter]
+command = '{FIXTURE}'
+args = ["--provides", "demo.wait=1.0.0", "--requires", "demo.text=^1"]
+"#
+    )
+}
+
+/// A dependency nobody serves is not a boot failure: the consumer is spawned and
+/// initialized, then held back. Its own capability is not routable meanwhile,
+/// and the very first `kernel.plugin.blocked` says why.
+#[tokio::test]
+async fn a_disabled_provider_leaves_its_consumer_waiting() {
+    let dir = scratch("waiting-boot");
+    let path = dir.join("eggshell.toml");
+    std::fs::write(&path, waiting_pair().replace("{disabled}", "true")).expect("write the config");
+
+    let mut kernel = HostProcess::spawn(&path).await;
+    let sub = kernel
+        .request("subscribe", json!({"patterns": ["kernel.plugin.blocked"], "replay": true}))
+        .await;
+    let (reply, events) = kernel.reply_and(&sub, "$/event", 1).await;
+    assert!(reply["result"]["subscription_id"].is_string());
+
+    let blocked = topic(&events, "kernel.plugin.blocked");
+    assert_eq!(blocked["params"]["payload"]["plugin"], json!("waiter"));
+    assert_eq!(blocked["params"]["payload"]["missing"], json!(["demo.text"]));
+    assert_eq!(blocked["params"]["payload"]["trigger"], json!("boot"));
+
+    let id = kernel.request("capabilities", json!({})).await;
+    let reply = kernel.reply(&id).await;
+    assert!(reply["result"]["demo.text"].is_null(), "{reply}");
+    assert!(reply["result"]["demo.wait"].is_null(), "{reply}");
+
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.wait", "method": "echo", "params": {}}))
+        .await;
+    assert_eq!(kernel.reply(&id).await["error"]["code"], json!(-32010));
+
+    let sub = kernel.request("subscribe", json!({"patterns": ["kernel.plugin.started"]})).await;
+    assert!(kernel.reply(&sub).await["result"]["subscription_id"].is_string());
+
+    std::fs::write(&path, waiting_pair().replace("{disabled}", "false")).expect("enable the row");
+    let provider = event_where(&mut kernel, "kernel.plugin.started", |p| {
+        p["plugin"] == json!("provider")
+    })
+    .await;
+    assert_eq!(provider["params"]["payload"]["trigger"], json!("config"));
+    let waiter = event_where(&mut kernel, "kernel.plugin.started", |p| {
+        p["plugin"] == json!("waiter")
+    })
+    .await;
+    assert_eq!(waiter["params"]["payload"]["trigger"], json!("config"));
+
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.wait", "method": "echo", "params": {"hi": 3}}))
+        .await;
+    assert_eq!(kernel.reply(&id).await["result"]["got"]["hi"], json!(3));
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+
+/// Taking the provider away from a running consumer drains that consumer, says
+/// so, and lets it back in the moment the provider returns.
+#[tokio::test]
+async fn disabling_a_provider_drains_its_consumer() {
+    let dir = scratch("waiting-drain");
+    let path = dir.join("eggshell.toml");
+    std::fs::write(&path, waiting_pair().replace("{disabled}", "false")).expect("write the config");
+
+    let mut kernel = HostProcess::spawn(&path).await;
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.wait", "method": "echo", "params": {"hi": 1}}))
+        .await;
+    assert_eq!(kernel.reply(&id).await["result"]["got"]["hi"], json!(1));
+
+    let sub = kernel.request("subscribe", json!({"patterns": ["kernel.plugin.*"]})).await;
+    assert!(kernel.reply(&sub).await["result"]["subscription_id"].is_string());
+
+    std::fs::write(&path, waiting_pair().replace("{disabled}", "true")).expect("disable the row");
+    let stopped = event_where(&mut kernel, "kernel.plugin.stopped", |p| {
+        p["plugin"] == json!("waiter")
+    })
+    .await;
+    assert_eq!(stopped["params"]["payload"]["trigger"], json!("config"));
+    let blocked = event_where(&mut kernel, "kernel.plugin.blocked", |p| {
+        p["plugin"] == json!("waiter")
+    })
+    .await;
+    assert_eq!(blocked["params"]["payload"]["missing"], json!(["demo.text"]));
+    assert_eq!(blocked["params"]["payload"]["trigger"], json!("config"));
+
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.wait", "method": "echo", "params": {}}))
+        .await;
+    assert_eq!(kernel.reply(&id).await["error"]["code"], json!(-32010));
+
+    std::fs::write(&path, waiting_pair().replace("{disabled}", "false")).expect("enable the row");
+    let provider = event_where(&mut kernel, "kernel.plugin.started", |p| {
+        p["plugin"] == json!("provider")
+    })
+    .await;
+    assert_eq!(provider["params"]["payload"]["trigger"], json!("config"));
+    let waiter = event_where(&mut kernel, "kernel.plugin.started", |p| {
+        p["plugin"] == json!("waiter")
+    })
+    .await;
+    assert_eq!(waiter["params"]["payload"]["trigger"], json!("config"));
+
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.wait", "method": "echo", "params": {"hi": 4}}))
+        .await;
+    assert_eq!(kernel.reply(&id).await["result"]["got"]["hi"], json!(4));
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+
+/// A pin that points at a `disabled` row is inert: the slot falls back to the
+/// plugin that is actually there, and the run stays a healthy one.
+#[tokio::test]
+async fn a_pin_at_a_disabled_row_only_warns() {
+    let dir = scratch("waiting-pin");
+    let path = config(
+        &dir,
+        &format!(
+            r#"
+[plugins.on]
+command = '{FIXTURE}'
+args = ["--provides", "demo.text=1.0.0"]
+
+[plugins.off]
+disabled = true
+command = '{FIXTURE}'
+args = ["--provides", "demo.text=2.0.0"]
+
+[capability]
+"demo.text" = "off"
+"#
+        ),
+    );
+
+    let mut kernel = HostProcess::spawn(&path).await;
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.text", "method": "echo", "params": {"hi": 5}}))
+        .await;
+    let reply = kernel.reply(&id).await;
+    assert_eq!(reply["result"]["got"]["hi"], json!(5), "{reply}");
+
+    assert!(kernel.saw_log("`off`, which is disabled").await, "{}", kernel.logs());
+
+    assert_eq!(kernel.shutdown().await, 0);
+}
+
+/// `--check` counts a waiting row and a disabled row as warnings: the report
+/// names both and the exit code stays zero.
+#[tokio::test]
+async fn check_reports_disabled_and_waiting_rows_and_still_exits_zero() {
+    let dir = scratch("waiting-check");
+    let path = dir.join("eggshell.toml");
+    std::fs::write(&path, waiting_pair().replace("{disabled}", "true")).expect("write the config");
+
+    let output = Command::new(EGGSHELL)
+        .arg(&path)
+        .arg("--check")
+        .output()
+        .await
+        .expect("run the kernel");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("disabled: provider"), "{stdout}");
+    assert!(stdout.contains("waiting: waiter needs demo.text"), "{stdout}");
+}
+#[tokio::test]
+async fn editing_a_plugin_row_brings_it_back() {
+    let dir = scratch("row-edit");
+    let path = dir.join("eggshell.toml");
+    let body = |marker: &str| {
+        format!(
+            r#"
+[plugins.provider]
+command = '{FIXTURE}'
+args = ["--provides", "demo.text=1.0.0"]
+
+[plugins.provider.config]
+marker = {marker}
+"#
+        )
+    };
+    std::fs::write(&path, body("1")).expect("write the config");
+
+    let mut kernel = HostProcess::spawn(&path).await;
+    let sub = kernel
+        .request("subscribe", json!({"patterns": ["kernel.plugin.started"], "replay": true}))
+        .await;
+    let (reply, events) = kernel.reply_and(&sub, "$/event", 1).await;
+    assert!(reply["result"]["subscription_id"].is_string());
+    let first = topic(&events, "kernel.plugin.started")["params"]["payload"]["pid"].clone();
+
+    std::fs::write(&path, body("2")).expect("edit the row");
+    let again = event_where(&mut kernel, "kernel.plugin.started", |p| {
+        p["plugin"] == json!("provider") && p["pid"] != first
+    })
+    .await;
+    assert_ne!(again["params"]["payload"]["pid"], first);
+
+    let id = kernel
+        .request("invoke", json!({"capability": "demo.text", "method": "echo", "params": {"hi": 9}}))
+        .await;
+    let reply = kernel.reply(&id).await;
+    assert_eq!(reply["result"]["got"]["hi"], json!(9), "{reply}");
 
     assert_eq!(kernel.shutdown().await, 0);
 }

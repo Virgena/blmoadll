@@ -144,7 +144,20 @@ args = ["--provides", "demo.other=1.0.0"]
 "#));
     let kernel = boot(&path).await;
     let mut host = kernel.host().expect("host channel");
-    kernel.subscribe(&["kernel.plugin.*".to_string()]).expect("subscribe");
+    kernel.subscribe(&["kernel.plugin.*".to_string()], true).expect("subscribe");
+
+    let mut replayed: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        let event = next(&mut host).await;
+        assert_eq!(event["params"]["topic"], json!("kernel.plugin.started"));
+        assert_eq!(event["params"]["payload"]["trigger"], json!("boot"));
+        assert!(event["params"]["payload"]["cwd"].is_string());
+        assert!(event["params"]["payload"]["command"].is_string());
+        assert!(event["params"]["payload"]["args"].is_array());
+        replayed.push(event["params"]["payload"]["plugin"].as_str().unwrap().to_string());
+    }
+    replayed.sort();
+    assert_eq!(replayed, ["doomed", "healthy"]);
 
     let error = kernel.invoke("demo.text", "echo", json!({})).await.unwrap_err();
     assert_eq!(error.code, -32011);

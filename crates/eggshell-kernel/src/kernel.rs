@@ -5,7 +5,7 @@
 //! that brief on purpose is `io`: multiplexing stdin/stdout is a transport job,
 //! and the docs say so out loud.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,12 +42,20 @@ struct Instance {
     gone: Option<Value>,
     /// We asked it to stop, so its exit is expected rather than a crash.
     shutting_down: bool,
+    stop_trigger: Option<&'static str>,
+    start_trigger: &'static str,
 }
 
 impl Instance {
     fn sink(&self) -> &process::Sink {
         &self.process.sink
     }
+}
+
+#[derive(Clone)]
+struct Waiting {
+    missing: Vec<String>,
+    trigger: &'static str,
 }
 
 struct StreamState {
@@ -74,6 +82,7 @@ struct State {
     config: Config,
     plugins: BTreeMap<String, Instance>,
     table: RoutingTable,
+    blocked: BTreeMap<String, Waiting>,
     bus: EventBus,
     streams: HashMap<String, StreamState>,
     /// `(provider, provider request id)` for calls that asked for a stream.
@@ -111,6 +120,7 @@ pub struct Kernel {
     stopping: AtomicBool,
     /// Set by SIGHUP: reload once even though the bytes on disk are unchanged.
     force_reload: AtomicBool,
+    restart_lock: tokio::sync::Mutex<()>,
     path: PathBuf,
 }
 
@@ -123,6 +133,8 @@ pub struct Report {
     pub plugins: Vec<Value>,
     pub capabilities: BTreeMap<String, Value>,
     pub start_order: Vec<String>,
+    pub disabled: Vec<String>,
+    pub blocked: BTreeMap<String, Vec<String>>,
     /// The config files this run was composed of, base first. A layered config
     /// is then visible in the report instead of assumed.
     pub sources: Vec<String>,
@@ -149,6 +161,8 @@ impl Report {
             "capabilities": self.capabilities,
             "planned_start_order": self.start_order,
             "config_sources": self.sources,
+            "disabled": self.disabled,
+            "blocked": self.blocked,
         })
     }
 
@@ -163,6 +177,12 @@ impl Report {
         }
         if !self.sources.is_empty() {
             out.push_str(&format!("config: {}\n", self.sources.join(" + ")));
+        }
+        if !self.disabled.is_empty() {
+            out.push_str(&format!("disabled: {}\n", self.disabled.join(", ")));
+        }
+        for (id, missing) in &self.blocked {
+            out.push_str(&format!("waiting: {id} needs {}\n", missing.join(", ")));
         }
         let order: Vec<String> = self.start_order.clone();
         out.push_str(&format!(
@@ -386,15 +406,26 @@ impl Kernel {
             }
         }
 
-        let capability = kernel.state.lock().unwrap().config.capability.clone();
+        let (capability, disabled) = {
+            let state = kernel.state.lock().unwrap();
+            (state.config.capability.clone(), state.config.disabled.clone())
+        };
         let declarations: Vec<Decl> = decls.values().cloned().collect();
-        let outcome = graph::validate(&declarations, &capability);
+        let outcome = graph::validate(&declarations, &capability, &disabled);
         report.warnings.extend(outcome.warnings.iter().cloned());
         if !outcome.errors.is_empty() {
             report.errors.extend(outcome.errors.iter().cloned());
             return Err(kernel.cleanup(report).await);
         }
-        let order = match graph::start_order(&declarations, &outcome.table) {
+        for warning in &report.warnings {
+            log::warn("kernel", &warning.message);
+        }
+        let runnable: Vec<Decl> = declarations
+            .iter()
+            .filter(|decl| !outcome.blocked.contains_key(&decl.id))
+            .cloned()
+            .collect();
+        let order = match graph::start_order(&runnable, &outcome.table) {
             Ok(order) => order,
             Err(issue) => {
                 report.errors.push(issue);
@@ -408,6 +439,13 @@ impl Kernel {
         {
             let mut state = kernel.state.lock().unwrap();
             state.table = outcome.table.clone();
+            state.blocked = outcome
+                .blocked
+                .iter()
+                .map(|(id, missing)| {
+                    (id.clone(), Waiting { missing: missing.clone(), trigger: proto::trigger::BOOT })
+                })
+                .collect();
             for (id, instance) in state.plugins.iter_mut() {
                 instance.view = table.clone();
                 if let Some(decl) = decls.get(id) {
@@ -422,6 +460,8 @@ impl Kernel {
             .map(|(c, r)| (c.clone(), json!({ "plugin": r.plugin, "version": r.version })))
             .collect();
         report.start_order = order.clone();
+        report.disabled = disabled.iter().cloned().collect();
+        report.blocked = outcome.blocked.clone();
         report.plugins = kernel.plugin_report();
         *kernel.report.lock().unwrap() = report.clone();
 
@@ -443,8 +483,17 @@ impl Kernel {
             return Err(report);
         }
 
+        for (id, missing) in &report.blocked {
+            let payload = json!({
+                "plugin": id,
+                "missing": missing,
+                "trigger": proto::trigger::BOOT,
+            });
+            let size = payload.to_string().len();
+            kernel.publish_event("kernel.plugin.blocked", payload, size);
+        }
         for id in &order {
-            if let Err(error) = kernel.start_plugin(id).await {
+            if let Err(error) = kernel.start_plugin(id, proto::trigger::BOOT).await {
                 report.errors.push(Issue::error(
                     error.code,
                     format!("`{id}` failed to start: {}", error.message),
@@ -481,6 +530,8 @@ impl Kernel {
                     started: false,
                     gone: None,
                     shutting_down: false,
+                    stop_trigger: None,
+                    start_trigger: proto::trigger::BOOT,
                 },
             );
         }
@@ -498,6 +549,7 @@ impl Kernel {
                 config,
                 plugins,
                 table: RoutingTable::new(),
+                blocked: BTreeMap::new(),
                 bus: EventBus::new(),
                 streams: HashMap::new(),
                 stream_calls: HashMap::new(),
@@ -523,6 +575,7 @@ impl Kernel {
             host: Mutex::new(Some(Host { rx: host_rx, bytes: host_bytes })),
             stopping: AtomicBool::new(false),
             force_reload: AtomicBool::new(false),
+            restart_lock: tokio::sync::Mutex::new(()),
             path,
         }
     }
@@ -1398,8 +1451,8 @@ impl Kernel {
 
     // ------------------------------------------------------------ lifecycle
 
-    async fn start_plugin(&self, id: &str) -> Result<(), RpcError> {
-        let (caps, timeout, pid, check) = {
+    async fn start_plugin(&self, id: &str, trigger: &'static str) -> Result<(), RpcError> {
+        let (caps, timeout, pid, check, cwd, command, args) = {
             let state = self.state.lock().unwrap();
             let instance = match state.plugins.get(id) {
                 Some(instance) => instance,
@@ -1410,25 +1463,43 @@ impl Kernel {
                 instance.cfg.timeouts.start(&state.config.limits),
                 instance.process.pid,
                 state.check_mode,
+                instance.cfg.cwd.display().to_string(),
+                instance.cfg.command.display().to_string(),
+                instance.cfg.args.clone(),
             )
         };
         // The snapshot handed over here is a starting reference; changes arrive
         // as `kernel.capabilities.changed`.
         self.call(id, method::START, json!({ "capabilities": caps }), timeout).await?;
-        self.state.lock().unwrap().plugins.get_mut(id).unwrap().started = true;
+        {
+            let mut state = self.state.lock().unwrap();
+            let instance = state.plugins.get_mut(id).unwrap();
+            instance.started = true;
+            instance.start_trigger = trigger;
+        }
         if !check {
-            self.publish_event("kernel.plugin.started", json!({ "plugin": id, "pid": pid }), 64);
+            let payload = json!({
+                "plugin": id,
+                "pid": pid,
+                "trigger": trigger,
+                "cwd": cwd,
+                "command": command,
+                "args": args,
+            });
+            let size = payload.to_string().len();
+            self.publish_event("kernel.plugin.started", payload, size);
         }
         Ok(())
     }
 
-    fn send_shutdown(&self, plugin: &str, reason: &str) -> bool {
+    fn send_shutdown(&self, plugin: &str, reason: &str, trigger: Option<&'static str>) -> bool {
         let mut state = self.state.lock().unwrap();
         let Some(instance) = state.plugins.get_mut(plugin) else { return false };
         if instance.gone.is_some() || instance.shutting_down {
             return false;
         }
         instance.shutting_down = true;
+        instance.stop_trigger = trigger;
         let id = instance.next_id;
         instance.next_id += 1;
         let (tx, _rx) = oneshot::channel();
@@ -1482,7 +1553,7 @@ impl Kernel {
 
     async fn shutdown_all(&self, reason: &str) {
         for id in self.ids() {
-            self.send_shutdown(&id, reason);
+            self.send_shutdown(&id, reason, None);
         }
         self.wait_until_gone().await;
         self.force_kill_remaining().await;
@@ -1600,7 +1671,7 @@ impl Kernel {
         }
 
         for id in self.ids() {
-            self.send_shutdown(&id, reason);
+            self.send_shutdown(&id, reason, None);
         }
         self.wait_until_gone().await;
         let killed = self.force_kill_remaining().await;
@@ -1665,7 +1736,7 @@ impl Kernel {
                 let state = self.state.lock().unwrap();
                 state.plugins.values().map(|i| i.decl.clone()).collect()
             };
-            let outcome = graph::validate(&declarations, &fresh.capability);
+            let outcome = graph::validate(&declarations, &fresh.capability, &fresh.disabled);
             if !outcome.errors.is_empty() {
                 log::error(
                     "kernel",
@@ -1677,11 +1748,12 @@ impl Kernel {
             {
                 let mut state = self.state.lock().unwrap();
                 state.table = outcome.table.clone();
-                state.config = fresh;
+                state.config = fresh.clone();
                 for instance in state.plugins.values_mut() {
                     instance.view = table.clone();
                 }
             }
+            self.clone().settle(&fresh, &[], proto::trigger::CONFIG).await;
             self.publish_event(
                 "kernel.capabilities.changed",
                 json!({ "capabilities": to_json(&outcome.table) }),
@@ -1701,10 +1773,47 @@ impl Kernel {
             &format!("reload: +{} ~{} -{}", added.len(), changed.len(), removed.len()),
         );
 
-        // 1. Bring the new instances up; they start against the new table.
         let new_ids: Vec<String> = added.iter().chain(changed.iter()).cloned().collect();
+        for id in &changed {
+            if let Err(error) = self.stop_plugin(id, proto::trigger::CONFIG).await {
+                log::error(
+                    "kernel",
+                    &format!("reload rejected: {}; keeping the running config", error.message),
+                );
+                return;
+            }
+        }
+        if let Err(error) = self.clone().bring_up(&new_ids, &fresh, &removed, proto::trigger::CONFIG).await {
+            log::error(
+                "kernel",
+                &format!("reload rejected: {}; keeping the running config", error.message),
+            );
+            return;
+        }
+        self.publish_event(
+            "kernel.config.reloaded",
+            json!({ "path": self.path.display().to_string() }),
+            64,
+        );
+        log::info("kernel", "reload applied");
+
+        self.clone().settle(&fresh, &removed, proto::trigger::CONFIG).await;
+        if !removed.is_empty() {
+            let kernel = self.clone();
+            let removed = removed.clone();
+            tokio::spawn(async move { kernel.retire(removed).await });
+        }
+    }
+
+    async fn bring_up(
+        self: Arc<Self>,
+        new_ids: &[String],
+        fresh: &Config,
+        removed: &[String],
+        trigger: &'static str,
+    ) -> Result<(), RpcError> {
         let mut frames: Vec<(String, Frames)> = Vec::new();
-        for id in &new_ids {
+        for id in new_ids {
             let cfg = fresh.plugins.get(id).unwrap().clone();
             match process::spawn(id, &cfg, &fresh.limits) {
                 Ok((process, stream)) => {
@@ -1721,17 +1830,15 @@ impl Kernel {
                             started: false,
                             gone: None,
                             shutting_down: false,
+                            stop_trigger: None,
+                            start_trigger: proto::trigger::BOOT,
                         },
                     );
                     frames.push((id.clone(), stream));
                 }
                 Err(error) => {
-                    log::error(
-                        "kernel",
-                        &format!("reload rejected: cannot start `{id}`: {error}; keeping the running config"),
-                    );
-                    self.abort_reload(&new_ids).await;
-                    return;
+                    self.abort_reload(&new_ids, trigger).await;
+                    return Err(RpcError::new(codes::INVALID_CONFIG, format!("cannot start `{id}`: {error}")));
                 }
             }
         }
@@ -1749,7 +1856,7 @@ impl Kernel {
                 .map(|(id, instance)| (id.clone(), instance.decl.clone()))
                 .collect()
         };
-        for id in &new_ids {
+        for id in new_ids {
             let (timeout, plugin_config) = {
                 let state = self.state.lock().unwrap();
                 let instance = state.plugins.get(id).unwrap();
@@ -1767,47 +1874,28 @@ impl Kernel {
                         decls.insert(id.clone(), decl);
                     }
                     Err(issue) => {
-                        log::error(
-                            "kernel",
-                            &format!("reload rejected: `{id}`: {}; keeping the running config", issue.message),
-                        );
-                        self.abort_reload(&new_ids).await;
-                        return;
+                        self.abort_reload(&new_ids, trigger).await;
+                        return Err(RpcError::new(issue.code, format!("`{id}`: {}", issue.message)));
                     }
                 },
                 Err(error) => {
-                    log::error(
-                        "kernel",
-                        &format!(
-                            "reload rejected: `{id}` failed to initialize: {}; keeping the running config",
-                            error.message
-                        ),
-                    );
-                    self.abort_reload(&new_ids).await;
-                    return;
+                    self.abort_reload(&new_ids, trigger).await;
+                    return Err(RpcError::new(error.code, format!("`{id}` failed to initialize: {}", error.message)));
                 }
             }
         }
 
         let declarations: Vec<Decl> = decls.values().cloned().collect();
-        let outcome = graph::validate(&declarations, &fresh.capability);
+        let outcome = graph::validate(&declarations, &fresh.capability, &fresh.disabled);
         if !outcome.errors.is_empty() {
-            log::error(
-                "kernel",
-                &format!("reload rejected: {}; keeping the running config", outcome.errors[0].message),
-            );
-            self.abort_reload(&new_ids).await;
-            return;
+            self.abort_reload(&new_ids, trigger).await;
+            return Err(RpcError::new(outcome.errors[0].code, outcome.errors[0].message.clone()));
         }
         let order = match graph::start_order(&declarations, &outcome.table) {
             Ok(order) => order,
             Err(issue) => {
-                log::error(
-                    "kernel",
-                    &format!("reload rejected: {}; keeping the running config", issue.message),
-                );
-                self.abort_reload(&new_ids).await;
-                return;
+                self.abort_reload(&new_ids, trigger).await;
+                return Err(RpcError::new(issue.code, issue.message));
             }
         };
 
@@ -1816,7 +1904,7 @@ impl Kernel {
         let new_table = Arc::new(outcome.table.clone());
         {
             let mut state = self.state.lock().unwrap();
-            for id in &new_ids {
+            for id in new_ids {
                 if let Some(decl) = decls.get(id) {
                     if let Some(instance) = state.plugins.get_mut(id) {
                         instance.decl = decl.clone();
@@ -1827,26 +1915,21 @@ impl Kernel {
                 }
             }
         }
-        for id in order.iter().filter(|id| new_ids.contains(id)) {
-            if let Err(error) = self.start_plugin(id).await {
-                log::error(
-                    "kernel",
-                    &format!(
-                        "reload rejected: `{id}` failed to start: {}; keeping the running config",
-                        error.message
-                    ),
-                );
-                self.abort_reload(&new_ids).await;
-                return;
+        let blocked = outcome.blocked.clone();
+        for id in order
+            .iter()
+            .filter(|id| new_ids.contains(id) && !blocked.contains_key(*id))
+        {
+            if let Err(error) = self.start_plugin(id, trigger).await {
+                self.abort_reload(&new_ids, trigger).await;
+                return Err(RpcError::new(error.code, format!("`{id}` failed to start: {}", error.message)));
             }
         }
 
-        // The swap: every instance now sees the new table, then the old
-        // instances drain. The kernel never restarts on a reload.
         {
             let mut state = self.state.lock().unwrap();
             state.table = outcome.table.clone();
-            state.config = fresh;
+            state.config = fresh.clone();
             for instance in state.plugins.values_mut() {
                 instance.view = new_table.clone();
             }
@@ -1856,24 +1939,13 @@ impl Kernel {
             json!({ "capabilities": to_json(&outcome.table) }),
             128,
         );
-        self.publish_event(
-            "kernel.config.reloaded",
-            json!({ "path": self.path.display().to_string() }),
-            64,
-        );
-        log::info("kernel", "reload applied");
-
-        let retiring: Vec<String> = removed.iter().chain(changed.iter()).cloned().collect();
-        if !retiring.is_empty() {
-            let kernel = self.clone();
-            tokio::spawn(async move { kernel.retire(retiring).await });
-        }
+        Ok(())
     }
 
     /// Undo a failed reload: drop the new instances, keep the old world serving.
-    async fn abort_reload(&self, ids: &[String]) {
+    async fn abort_reload(&self, ids: &[String], trigger: &'static str) {
         for id in ids {
-            self.send_shutdown(id, proto::reason::RELOAD);
+            self.send_shutdown(id, proto::reason::RELOAD, Some(trigger));
         }
         tokio::time::sleep(POLL).await;
         let mut state = self.state.lock().unwrap();
@@ -1902,7 +1974,7 @@ impl Kernel {
             tokio::time::sleep(POLL).await;
         }
         for id in &ids {
-            self.send_shutdown(id, proto::reason::RELOAD);
+            self.send_shutdown(id, proto::reason::RELOAD, Some(proto::trigger::CONFIG));
         }
         let deadline = Instant::now() + Duration::from_millis(self.cfg().shutdown_grace_ms);
         loop {
@@ -1929,6 +2001,181 @@ impl Kernel {
         }
     }
 
+    /// Waiting plugins stop when their dependencies leave and start again when
+    /// those come back. `leaving` names the ids this reload retires anyway.
+    async fn settle(
+        self: Arc<Self>,
+        fresh: &Config,
+        leaving: &[String],
+        trigger: &'static str,
+    ) -> BTreeSet<String> {
+        let (declarations, before) = {
+            let state = self.state.lock().unwrap();
+            let declarations: Vec<Decl> = state
+                .plugins
+                .iter()
+                .filter(|(id, _)| !leaving.contains(id))
+                .map(|(_, instance)| instance.decl.clone())
+                .collect();
+            (declarations, state.blocked.clone())
+        };
+        let outcome = graph::validate(&declarations, &fresh.capability, &fresh.disabled);
+        if !outcome.errors.is_empty() {
+            log::error("kernel", &format!("waiting pass rejected: {}", outcome.errors[0].message));
+            return BTreeSet::new();
+        }
+        let blocked = outcome.blocked.clone();
+        let mut stop: Vec<String> = Vec::new();
+        let mut wake: Vec<String> = Vec::new();
+        let mut respawn: Vec<String> = Vec::new();
+        {
+            let state = self.state.lock().unwrap();
+            for (id, instance) in &state.plugins {
+                if leaving.contains(id) {
+                    continue;
+                }
+                let waited_before = before.contains_key(id);
+                if blocked.contains_key(id) {
+                    if !waited_before && instance.started && instance.gone.is_none() {
+                        stop.push(id.clone());
+                    }
+                    continue;
+                }
+                if waited_before && !instance.started {
+                    if instance.gone.is_none() {
+                        wake.push(id.clone());
+                    } else {
+                        respawn.push(id.clone());
+                    }
+                }
+            }
+        }
+        for id in &stop {
+            self.stop_waiting(id, trigger).await;
+        }
+        for id in &wake {
+            if let Err(error) = self.start_plugin(id, trigger).await {
+                log::error(
+                    "kernel",
+                    &format!("`{id}` could not leave the waiting state: {}", error.message),
+                );
+            }
+        }
+        for id in &respawn {
+            if let Err(error) = self.clone().bring_up(std::slice::from_ref(id), fresh, &[], trigger).await {
+                log::error(
+                    "kernel",
+                    &format!("`{id}` could not leave the waiting state: {}", error.message),
+                );
+            }
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            state.blocked = blocked
+                .iter()
+                .map(|(id, missing)| (id.clone(), Waiting { missing: missing.clone(), trigger }))
+                .collect();
+        }
+        for (id, missing) in &blocked {
+            if before.contains_key(id) {
+                continue;
+            }
+            let payload = json!({ "plugin": id, "missing": missing, "trigger": trigger });
+            let size = payload.to_string().len();
+            self.publish_event("kernel.plugin.blocked", payload, size);
+        }
+        blocked.into_keys().collect()
+    }
+
+    /// Stops a plugin that just became a waiting one, keeping its entry.
+    async fn stop_waiting(&self, id: &str, trigger: &'static str) {
+        let grace = {
+            let state = self.state.lock().unwrap();
+            match state.plugins.get(id) {
+                Some(instance) => instance.cfg.timeouts.shutdown_grace(&state.config.limits),
+                None => return,
+            }
+        };
+        self.send_shutdown(id, proto::reason::RELOAD, Some(trigger));
+        if !self.await_gone(id, grace).await {
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(instance) = state.plugins.get_mut(id) {
+                    instance.process.force_kill();
+                }
+            }
+            self.await_gone(id, grace).await;
+        }
+        if let Some(instance) = self.state.lock().unwrap().plugins.get_mut(id) {
+            instance.started = false;
+        }
+    }
+    async fn restart_plugin(self: Arc<Self>, id: &str, trigger: &'static str) -> Result<(), RpcError> {
+        let _guard = self.restart_lock.lock().await;
+        let fresh = self.state.lock().unwrap().config.clone();
+        if !fresh.plugins.contains_key(id) {
+            return Err(RpcError::new(codes::INVALID_PARAMS, format!("no plugin `{id}`")));
+        }
+        self.stop_plugin(id, trigger).await?;
+        let outcome = self.clone().bring_up(&[id.to_string()], &fresh, &[], trigger).await;
+        if outcome.is_ok() {
+            self.clone().settle(&fresh, &[], trigger).await;
+        }
+        if let Err(error) = &outcome {
+            log::error(
+                "kernel",
+                &format!("restart rejected: {}; `{id}` stays unavailable until the next restart", error.message),
+            );
+        }
+        outcome.map_err(|error| RpcError {
+            code: codes::PROVIDER_UNAVAILABLE,
+            message: format!("`{id}` failed to restart: {}", error.message),
+            data: Some(json!({ "plugin": id })),
+        })
+    }
+
+    async fn stop_plugin(&self, id: &str, trigger: &'static str) -> Result<(), RpcError> {
+        let grace = {
+            let state = self.state.lock().unwrap();
+            match state.plugins.get(id) {
+                Some(instance) => instance.cfg.timeouts.shutdown_grace(&state.config.limits),
+                None => return Ok(()),
+            }
+        };
+        self.send_shutdown(id, proto::reason::RELOAD, Some(trigger));
+        if !self.await_gone(id, grace).await {
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(instance) = state.plugins.get_mut(id) {
+                    instance.process.force_kill();
+                }
+            }
+            if !self.await_gone(id, grace).await {
+                return Err(RpcError {
+                    code: codes::PROVIDER_UNAVAILABLE,
+                    message: format!("`{id}` is still running; not restarting it"),
+                    data: Some(json!({ "plugin": id })),
+                });
+            }
+        }
+        self.state.lock().unwrap().plugins.remove(id);
+        Ok(())
+    }
+
+    async fn await_gone(&self, id: &str, grace_ms: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_millis(grace_ms);
+        loop {
+            let alive = {
+                let state = self.state.lock().unwrap();
+                matches!(state.plugins.get(id), Some(instance) if instance.gone.is_none())
+            };
+            if !alive || Instant::now() >= deadline {
+                return !alive;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+
     async fn on_closed(self: Arc<Self>, plugin: &str) {
         // `wait` can yield, so the child is taken out of the lock first.
         let child = {
@@ -1948,14 +2195,16 @@ impl Kernel {
         }
         let detail = process::exit_payload(plugin, status);
 
-        let (expected, check_mode, orphans, failed) = {
+        let (expected, check_mode, orphans, failed, trigger) = {
             let mut state = self.state.lock().unwrap();
             state.bus.remove_plugin(plugin);
             let check_mode = state.check_mode;
             let mut expected = true;
             let mut failed = Vec::new();
+            let mut trigger = None;
             if let Some(instance) = state.plugins.get_mut(plugin) {
                 expected = instance.shutting_down;
+                trigger = instance.stop_trigger;
                 instance.gone = Some(detail.clone());
                 instance.inflight = 0;
                 failed.extend(std::mem::take(&mut instance.waiting).into_values());
@@ -1977,7 +2226,7 @@ impl Kernel {
                 state.upstream.retain(|_, sid| sid != id);
             }
             state.inflight_total = state.plugins.values().map(|i| i.inflight).sum();
-            (expected, check_mode, orphans, failed)
+            (expected, check_mode, orphans, failed, trigger)
         };
 
         for tx in failed {
@@ -2003,14 +2252,17 @@ impl Kernel {
                 128,
             );
         }
-        self.publish_event(
-            "kernel.plugin.stopped",
-            json!({
-                "plugin": plugin,
-                "reason": if expected { "shutdown" } else { "crash" },
-            }),
-            64,
-        );
+        let mut payload = json!({
+            "plugin": plugin,
+            "reason": if expected { "shutdown" } else { "crash" },
+        });
+        if expected {
+            if let Some(trigger) = trigger {
+                payload["trigger"] = json!(trigger);
+            }
+        }
+        let size = payload.to_string().len();
+        self.publish_event("kernel.plugin.stopped", payload, size);
     }
 }
 
@@ -2103,9 +2355,51 @@ impl Kernel {
     }
 
     /// Subscribes the embedder to event topics, exactly like a plugin would.
-    pub fn subscribe(&self, patterns: &[String]) -> Result<String, RpcError> {
+    pub fn subscribe(&self, patterns: &[String], replay: bool) -> Result<String, RpcError> {
         let reply = self.subscribe_as(HOST, &json!({ "patterns": patterns }))?;
+        if replay {
+            self.announce_running();
+        }
         Ok(reply["subscription_id"].as_str().unwrap_or_default().to_string())
+    }
+
+    fn announce_running(&self) {
+        let live: Vec<Value> = {
+            let state = self.state.lock().unwrap();
+            state
+                .plugins
+                .iter()
+                .filter(|(_, instance)| instance.started && instance.gone.is_none())
+                .map(|(id, instance)| {
+                    json!({
+                        "plugin": id,
+                        "pid": instance.process.pid,
+                        "trigger": instance.start_trigger,
+                        "cwd": instance.cfg.cwd.display().to_string(),
+                        "command": instance.cfg.command.display().to_string(),
+                        "args": instance.cfg.args,
+                    })
+                })
+                .collect()
+        };
+        for payload in live {
+            let size = payload.to_string().len();
+            self.publish_event("kernel.plugin.started", payload, size);
+        }
+        let waiting: Vec<Value> = {
+            let state = self.state.lock().unwrap();
+            state
+                .blocked
+                .iter()
+                .map(|(id, entry)| {
+                    json!({ "plugin": id, "missing": entry.missing, "trigger": entry.trigger })
+                })
+                .collect()
+        };
+        for payload in waiting {
+            let size = payload.to_string().len();
+            self.publish_event("kernel.plugin.blocked", payload, size);
+        }
     }
 
     pub fn unsubscribe(&self, subscription_id: &str) -> Result<(), RpcError> {
@@ -2191,6 +2485,10 @@ impl Kernel {
     /// only ever says `ui_quit` calls `shutdown`.
     pub fn shutdown_with(&self, reason: &'static str) {
         let _ = self.shutdown_tx.send(reason);
+    }
+
+    pub async fn restart(self: &Arc<Self>, plugin: &str, trigger: &'static str) -> Result<(), RpcError> {
+        self.clone().restart_plugin(plugin, trigger).await
     }
 
     /// The embedder gives up one of its own streams or calls. The params are the

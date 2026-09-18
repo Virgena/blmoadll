@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use eggshell_kernel::{Host, Kernel};
 use eggshell_loader::Config;
 use eggshell_log as log;
-use eggshell_protocol::{codes, failure, method, parse_frame, read_frame, reason, success, write_frame, Incoming, RpcError};
+use eggshell_protocol::{codes, failure, method, parse_frame, read_frame, reason, success, trigger, write_frame, Incoming, RpcError};
 
 /// Frame cap for the host pipe. The plugin pipes keep their own
 /// `max_frame_bytes`; this is the host's limit.
@@ -214,7 +214,8 @@ async fn answer(kernel: &Arc<Kernel>, out: &mpsc::Sender<Value>, id: Value, name
         "capabilities" => success(id, kernel.capabilities()),
         "subscribe" => {
             let patterns = string_list(&params, "patterns");
-            match kernel.subscribe(&patterns) {
+            let replay = params.get("replay").and_then(Value::as_bool).unwrap_or(false);
+            match kernel.subscribe(&patterns, replay) {
                 Ok(subscription_id) => success(id, json!({ "subscription_id": subscription_id })),
                 Err(error) => failure(id, &error),
             }
@@ -222,6 +223,25 @@ async fn answer(kernel: &Arc<Kernel>, out: &mpsc::Sender<Value>, id: Value, name
         "unsubscribe" => {
             let subscription_id = str_field(&params, "subscription_id");
             match kernel.unsubscribe(&subscription_id) {
+                Ok(()) => success(id, json!({})),
+                Err(error) => failure(id, &error),
+            }
+        }
+        "restart" => {
+            let plugin = str_field(&params, "plugin");
+            let trigger = match params.get("reason").and_then(Value::as_str) {
+                None | Some(trigger::MANUAL) => trigger::MANUAL,
+                Some(trigger::SOURCE) => trigger::SOURCE,
+                Some(other) => {
+                    let error = RpcError::new(
+                        codes::INVALID_PARAMS,
+                        format!("restart reason must be \"source\" or \"manual\", not \"{other}\""),
+                    );
+                    let _ = out.send(failure(id, &error)).await;
+                    return;
+                }
+            };
+            match kernel.restart(&plugin, trigger).await {
                 Ok(()) => success(id, json!({})),
                 Err(error) => failure(id, &error),
             }

@@ -6,7 +6,7 @@
 //!     eggshell-fixture --provides demo.text=1.0.0 [options]
 //!
 //! Options: `--requires <cap>=<range>` (repeatable), `--chunks <n>`,
-//! `--exit-on-start`, `--exit-on-invoke`.
+//! `--exit-on-start`, `--exit-on-invoke`, `--exit-if <path>`.
 
 use std::process::ExitCode;
 
@@ -25,6 +25,7 @@ struct Args {
     chunks: usize,
     exit_on_start: bool,
     exit_on_invoke: bool,
+    exit_if: Option<String>,
 }
 
 fn parse() -> Args {
@@ -49,6 +50,7 @@ fn parse() -> Args {
             "--chunks" => args.chunks = rest.next().and_then(|n| n.parse().ok()).unwrap_or(0),
             "--exit-on-start" => args.exit_on_start = true,
             "--exit-on-invoke" => args.exit_on_invoke = true,
+            "--exit-if" => args.exit_if = rest.next(),
             _ => {}
         }
     }
@@ -62,6 +64,9 @@ fn split_spec(spec: &str) -> Option<(&str, &str)> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args = parse();
+    if args.exit_if.as_deref().is_some_and(|path| std::path::Path::new(path).exists()) {
+        return ExitCode::from(9);
+    }
     let mut reader = BufReader::new(tokio::io::stdin());
     let mut out = tokio::io::stdout();
 

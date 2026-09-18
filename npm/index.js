@@ -1,4 +1,4 @@
-// 宿主从这儿拿内核路径:
+// Hosts take the kernel path from here:
 //   import { kernel, fixture } from "eggshell-kernel";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -12,13 +12,13 @@ const installed = (name) => {
   return existsSync(path) ? path : null;
 };
 
-/** 内核（eggshell 宿主）的绝对路径；没装好是 null。 */
+/** Absolute path of the kernel (the eggshell host); null when it is not installed. */
 export const kernel = installed("eggshell");
 
-/** 替身插件（cargo --features fixture）的绝对路径；没构建就是 null。 */
+/** Absolute path of the test double (cargo --features fixture); null when it is not built. */
 export const fixture = installed("eggshell-fixture");
 
-/** 拿内核路径，没装好就抛 —— 比在 spawn 里吃一个 ENOENT 好读。 */
+/** The kernel path, or a throw when it is not installed: friendlier than an ENOENT out of spawn. */
 export function requireKernel() {
   if (kernel === null) {
     throw new Error(`eggshell-kernel: No binaries yet; runs on Node "${join(here, "install.js")}"`);

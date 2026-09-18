@@ -53,6 +53,9 @@ pub struct Report {
     pub table: RoutingTable,
     pub errors: Vec<Issue>,
     pub warnings: Vec<Issue>,
+    /// Plugins that did not join the table because a required capability of
+    /// theirs has no provider: plugin id to the capabilities it waits for.
+    pub blocked: BTreeMap<String, Vec<String>>,
 }
 
 /// Reads `provides` / `requires` out of an `initialize` reply.
@@ -119,22 +122,124 @@ pub fn satisfies(range: &str, version: &str) -> Result<bool, String> {
 /// plugin declares becomes routable, so the config file never has to restate
 /// it. `pins` only speaks up when two configured plugins offer the same
 /// capability and one of them has to win.
-pub fn validate(decls: &[Decl], pins: &BTreeMap<String, String>) -> Report {
-    let mut report = Report::default();
-    let by_id: BTreeMap<&str, &Decl> = decls.iter().map(|d| (d.id.as_str(), d)).collect();
+///
+/// A plugin whose required capabilities nobody serves does not join the table.
+/// It is left out and reported in `blocked`, which can block its dependents in
+/// turn. `disabled` names the ids the config turned off, so a pin pointing at
+/// one of them can say so instead of looking like a typo.
+pub fn validate(
+    decls: &[Decl],
+    pins: &BTreeMap<String, String>,
+    disabled: &BTreeSet<String>,
+) -> Report {
+    let all: BTreeMap<&str, &Decl> = decls
+        .iter()
+        .filter(|decl| !disabled.contains(decl.id.as_str()))
+        .map(|decl| (decl.id.as_str(), decl))
+        .collect();
+    let mut candidates: BTreeSet<&str> = all.keys().copied().collect();
+    let mut blocked: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-    // A pin wins, and it has to name a plugin that really offers the slot.
+    loop {
+        let active: Vec<&Decl> = decls
+            .iter()
+            .filter(|decl| candidates.contains(decl.id.as_str()))
+            .collect();
+        let mut report = build_table(&active, &candidates, &all, pins, disabled);
+        let unserved: Vec<(String, Vec<String>)> = active
+            .iter()
+            .filter_map(|decl| {
+                let missing: Vec<String> = decl
+                    .requires
+                    .iter()
+                    .filter(|req| !req.optional)
+                    .filter(|req| !serves(&report.table, req))
+                    .map(|req| req.capability.clone())
+                    .collect();
+                if missing.is_empty() {
+                    None
+                } else {
+                    Some((decl.id.clone(), missing))
+                }
+            })
+            .collect();
+
+        if unserved.is_empty() {
+            for (id, missing) in &blocked {
+                report.warnings.extend(blocking_issues(all[id.as_str()], missing, &report.table));
+            }
+            report.blocked = blocked;
+            return report;
+        }
+        for (id, missing) in unserved {
+            candidates.remove(id.as_str());
+            blocked.insert(id, missing);
+        }
+    }
+}
+
+/// Whether a routing table has a provider of `req` at a version it accepts.
+fn serves(table: &RoutingTable, req: &Req) -> bool {
+    let Some(route) = table.get(&req.capability) else {
+        return false;
+    };
+    matches!(satisfies(&req.version, &route.version), Ok(true))
+}
+
+/// One warning per capability a waiting plugin cannot reach.
+fn blocking_issues(decl: &Decl, missing: &[String], table: &RoutingTable) -> Vec<Issue> {
+    missing
+        .iter()
+        .map(|capability| {
+            let range = decl
+                .requires
+                .iter()
+                .find(|req| &req.capability == capability)
+                .map(|req| req.version.clone())
+                .unwrap_or_default();
+            match table.get(capability) {
+                Some(route) => Issue::warning(format!(
+                    "`{}` was not started: `{}` provides `{capability}` {} but `{}` requires {range}",
+                    decl.id, route.plugin, route.version, decl.id
+                )),
+                None => Issue::warning(format!(
+                    "`{}` was not started: no provider is configured for `{capability}`{}",
+                    decl.id,
+                    closest(capability, table.keys().map(String::as_str))
+                )),
+            }
+        })
+        .collect()
+}
+
+fn pin_issue(slot: &str, plugin: &str, reason: &str) -> Issue {
+    Issue::warning(format!(
+        "capability `{slot}` names `{plugin}`, which {reason}; the pin has no effect"
+    ))
+    .at(format!("capability.{slot}"))
+}
+
+/// One round of the table: pins first, then whatever is left to derive.
+fn build_table(
+    active: &[&Decl],
+    candidates: &BTreeSet<&str>,
+    all: &BTreeMap<&str, &Decl>,
+    pins: &BTreeMap<String, String>,
+    disabled: &BTreeSet<String>,
+) -> Report {
+    let mut report = Report::default();
+
     for (slot, plugin) in pins {
-        let Some(decl) = by_id.get(plugin.as_str()) else {
-            report.errors.push(
-                Issue::error(
-                    codes::INVALID_CONFIG,
-                    format!("capability `{slot}` is mapped to `{plugin}`, which is not configured"),
-                )
-                .at(format!("capability.{slot}")),
-            );
+        let Some(decl) = all.get(plugin.as_str()) else {
+            let reason =
+                if disabled.contains(plugin) { "is disabled" } else { "is not configured" };
+            report.warnings.push(pin_issue(slot, plugin, reason));
             continue;
         };
+        if !candidates.contains(plugin.as_str()) {
+            report.warnings.push(pin_issue(slot, plugin, "is blocked"));
+            continue;
+        }
         match decl.provides.iter().find(|(cap, _)| cap == slot) {
             Some((_, version)) => {
                 report.table.insert(
@@ -167,10 +272,10 @@ pub fn validate(decls: &[Decl], pins: &BTreeMap<String, String>) -> Report {
         }
     }
 
-    // Nothing pinned: derive. One provider per capability needs no decision,
-    // two need the config to say which one.
+    // Whatever the pins did not settle: one provider needs no decision, two
+    // need the config to say which one.
     let mut offered: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
-    for decl in decls {
+    for decl in active {
         for (cap, version) in &decl.provides {
             offered
                 .entry(cap.as_str())
@@ -179,7 +284,7 @@ pub fn validate(decls: &[Decl], pins: &BTreeMap<String, String>) -> Report {
         }
     }
     for (cap, providers) in &offered {
-        if pins.contains_key(*cap) {
+        if report.table.contains_key(*cap) {
             continue;
         }
         if providers.len() == 1 {
@@ -207,7 +312,7 @@ pub fn validate(decls: &[Decl], pins: &BTreeMap<String, String>) -> Report {
         );
     }
 
-    for decl in decls {
+    for decl in active {
         for (cap, version) in &decl.provides {
             if let Err(e) = Version::parse(version) {
                 report.errors.push(Issue::error(
@@ -219,51 +324,28 @@ pub fn validate(decls: &[Decl], pins: &BTreeMap<String, String>) -> Report {
     }
 
     let mut used: BTreeSet<String> = BTreeSet::new();
-    for decl in decls {
+    for decl in active {
         for req in &decl.requires {
-            match report.table.get(&req.capability) {
-                Some(route) => match satisfies(&req.version, &route.version) {
-                    Ok(true) => {
-                        used.insert(req.capability.clone());
-                    }
-                    Ok(false) => {
-                        let message = format!(
-                            "`{}` requires `{}` {} but `{}` provides {}",
-                            decl.id, req.capability, req.version, route.plugin, route.version
-                        );
-                        if req.optional {
-                            report.warnings.push(Issue::warning(format!(
-                                "optional dependency skipped: {message}"
-                            )));
-                        } else {
-                            report.errors.push(Issue::error(codes::INVALID_CONFIG, message));
-                        }
-                    }
-                    Err(e) => {
-                        report.errors.push(Issue::error(
-                            codes::INVALID_CONFIG,
-                            format!("`{}`: {e}", decl.id),
-                        ));
-                    }
-                },
-                None => {
-                    let hint = closest(&req.capability, report.table.keys().map(String::as_str));
-                    if req.optional {
-                        report.warnings.push(Issue::warning(format!(
-                            "optional dependency skipped: `{}` requires `{}` but no provider is configured{}",
-                            decl.id, req.capability, hint
-                        )));
-                    } else {
-                        report.errors.push(Issue::error(
-                            codes::INVALID_CONFIG,
-                            format!(
-                                "`{}` requires `{}` but no provider is configured{}",
-                                decl.id, req.capability, hint
-                            ),
-                        ));
-                    }
-                }
+            if serves(&report.table, req) {
+                used.insert(req.capability.clone());
+                continue;
             }
+            if !req.optional {
+                continue;
+            }
+            let message = match report.table.get(&req.capability) {
+                Some(route) => format!(
+                    "`{}` requires `{}` {} but `{}` provides {}",
+                    decl.id, req.capability, req.version, route.plugin, route.version
+                ),
+                None => format!(
+                    "`{}` requires `{}` but no provider is configured{}",
+                    decl.id,
+                    req.capability,
+                    closest(&req.capability, report.table.keys().map(String::as_str))
+                ),
+            };
+            report.warnings.push(Issue::warning(format!("optional dependency skipped: {message}")));
         }
     }
 
@@ -410,6 +492,19 @@ mod tests {
         pairs.iter().map(|(c, p)| (c.to_string(), p.to_string())).collect()
     }
 
+
+    fn check(decls: &[Decl], pins: &BTreeMap<String, String>) -> Report {
+        validate(decls, pins, &BTreeSet::new())
+    }
+
+    fn check_off(
+        decls: &[Decl],
+        pins: &BTreeMap<String, String>,
+        disabled: &[&str],
+    ) -> Report {
+        let disabled: BTreeSet<String> = disabled.iter().map(|id| id.to_string()).collect();
+        validate(decls, pins, &disabled)
+    }
     #[test]
     fn reads_declarations_from_an_initialize_reply() {
         let params = json!({
@@ -438,7 +533,7 @@ mod tests {
     #[test]
     fn builds_the_table_and_reports_an_unprovided_slot() {
         let decls = vec![decl("provider", &[("demo.text", "1.0.0")], &[])];
-        let report = validate(&decls, &slots(&[("demo.text", "provider"), ("demo.web", "provider")]));
+        let report = check(&decls, &slots(&[("demo.text", "provider"), ("demo.web", "provider")]));
         assert_eq!(report.table["demo.text"].version, "1.0.0");
         assert_eq!(report.errors.len(), 1, "{report:?}");
         assert!(report.errors[0].message.contains("does not provide `demo.web`"));
@@ -446,45 +541,73 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_dependency_fails_but_optional_is_skipped() {
+    fn a_required_dependency_nobody_serves_leaves_the_consumer_waiting() {
         let decls = vec![decl(
             "consumer",
             &[("demo.loop", "1.0.0")],
             &[("demo.text", "^1", false), ("demo.tools", "^1", true)],
         )];
-        let report = validate(&decls, &slots(&[("demo.loop", "consumer")]));
-        assert_eq!(report.errors.len(), 1, "{report:?}");
-        assert!(report.errors[0].message.contains("requires `demo.text`"));
-        // Two warnings: the skipped optional dependency, plus the unused `demo.loop` slot.
-        assert_eq!(report.warnings.len(), 2, "{report:?}");
+        let report = check(&decls, &slots(&[("demo.loop", "consumer")]));
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.blocked["consumer"], vec!["demo.text".to_string()], "{report:?}");
+        assert!(report.table.is_empty(), "{report:?}");
         assert!(
-            report.warnings.iter().any(|w| w.message.contains("optional dependency skipped")),
+            report
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("was not started") && w.message.contains("`demo.text`")),
+            "{report:?}"
+        );
+        assert!(
+            report.warnings.iter().any(|w| w.message.contains("is blocked; the pin has no effect")),
             "{report:?}"
         );
     }
 
     #[test]
-    fn version_mismatch_is_an_error_when_required_and_a_warning_when_optional() {
+    fn blocking_cascades_along_the_dependency_chain() {
+        let decls = vec![
+            decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^1", false)]),
+            decl("provider", &[("demo.text", "1.0.0")], &[("demo.store", "^1", false)]),
+        ];
+        let report = check(&decls, &slots(&[("demo.loop", "consumer"), ("demo.text", "provider")]));
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.blocked.len(), 2, "{report:?}");
+        assert_eq!(report.blocked["provider"], vec!["demo.store".to_string()]);
+        assert_eq!(report.blocked["consumer"], vec!["demo.text".to_string()]);
+        assert!(report.table.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn version_mismatch_leaves_the_consumer_waiting_and_warns_when_optional() {
         let decls = vec![
             decl("provider", &[("demo.text", "1.0.0")], &[]),
             decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^2", false)]),
         ];
-        let report = validate(
+        let report = check(
             &decls,
             &slots(&[("demo.loop", "consumer"), ("demo.text", "provider")]),
         );
-        assert_eq!(report.errors.len(), 1, "{report:?}");
-        assert!(report.errors[0].message.contains("provides 1.0.0"), "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.blocked["consumer"], vec!["demo.text".to_string()], "{report:?}");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("provides `demo.text` 1.0.0")),
+            "{report:?}"
+        );
 
         let optional = vec![
             decl("provider", &[("demo.text", "1.0.0")], &[]),
             decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^2", true)]),
         ];
-        let report = validate(
+        let report = check(
             &optional,
             &slots(&[("demo.loop", "consumer"), ("demo.text", "provider")]),
         );
         assert!(report.errors.is_empty(), "{report:?}");
+        assert!(report.blocked.is_empty(), "{report:?}");
         assert!(
             report.warnings.iter().any(|w| w.message.contains("optional dependency skipped")),
             "{report:?}"
@@ -494,19 +617,23 @@ mod tests {
     #[test]
     fn suggests_a_close_capability_name() {
         let decls = vec![decl("store-provider", &[("demo.store", "1.0.0")], &[])];
-        let report = validate(&decls, &slots(&[("demo.store", "store-provider")]));
+        let report = check(&decls, &slots(&[("demo.store", "store-provider")]));
         assert!(report.errors.is_empty(), "{report:?}");
 
         let decls = vec![
             decl("store-provider", &[("demo.store", "1.0.0")], &[]),
             decl("consumer", &[("demo.loop", "1.0.0")], &[("demoo.store", "^1", false)]),
         ];
-        let report = validate(
+        let report = check(
             &decls,
             &slots(&[("demo.store", "store-provider"), ("demo.loop", "consumer")]),
         );
-        assert_eq!(report.errors.len(), 1, "{report:?}");
-        assert!(report.errors[0].message.contains("did you mean `demo.store`?"), "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.blocked["consumer"], vec!["demoo.store".to_string()], "{report:?}");
+        assert!(
+            report.warnings.iter().any(|w| w.message.contains("did you mean `demo.store`?")),
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -516,7 +643,7 @@ mod tests {
             decl("provider", &[("demo.text", "1.0.0")], &[]),
             decl("subscriber", &[], &[("demo.loop", "^1", false)]),
         ];
-        let report = validate(
+        let report = check(
             &decls,
             &slots(&[
                 ("demo.loop", "consumer"),
@@ -534,7 +661,7 @@ mod tests {
             decl("a", &[("cap.a", "1.0.0")], &[("cap.b", "^1", false)]),
             decl("b", &[("cap.b", "1.0.0")], &[("cap.a", "^1", false)]),
         ];
-        let report = validate(&decls, &slots(&[("cap.a", "a"), ("cap.b", "b")]));
+        let report = check(&decls, &slots(&[("cap.a", "a"), ("cap.b", "b")]));
         assert!(report.errors.is_empty(), "{report:?}");
         let err = start_order(&decls, &report.table).unwrap_err();
         assert!(err.message.contains("dependency cycle"), "{}", err.message);
@@ -544,7 +671,7 @@ mod tests {
     #[test]
     fn a_plugin_may_require_what_it_provides() {
         let decls = vec![decl("solo", &[("cap.x", "1.0.0")], &[("cap.x", "^1", false)])];
-        let report = validate(&decls, &slots(&[("cap.x", "solo")]));
+        let report = check(&decls, &slots(&[("cap.x", "solo")]));
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(start_order(&decls, &report.table).unwrap(), vec!["solo"]);
     }
@@ -555,7 +682,7 @@ mod tests {
             decl("provider", &[("demo.text", "1.0.0")], &[]),
             decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^1", false)]),
         ];
-        let report = validate(&decls, &BTreeMap::new());
+        let report = check(&decls, &BTreeMap::new());
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.table["demo.text"].plugin, "provider");
         assert_eq!(report.table["demo.loop"].plugin, "consumer");
@@ -568,16 +695,77 @@ mod tests {
             decl("a", &[("demo.text", "1.0.0")], &[]),
             decl("b", &[("demo.text", "1.0.0")], &[]),
         ];
-        let report = validate(&decls, &BTreeMap::new());
+        let report = check(&decls, &BTreeMap::new());
         assert_eq!(report.errors.len(), 1, "{report:?}");
         let message = &report.errors[0].message;
         assert!(message.contains("`a`") && message.contains("`b`"), "{message}");
         assert!(message.contains("capability.\"demo.text\""), "{message}");
         assert_eq!(report.errors[0].field.as_deref(), Some("capability.demo.text"));
 
-        let pinned = validate(&decls, &slots(&[("demo.text", "b")]));
+        let pinned = check(&decls, &slots(&[("demo.text", "b")]));
         assert!(pinned.errors.is_empty(), "{pinned:?}");
         assert_eq!(pinned.table["demo.text"].plugin, "b");
+    }
+
+    #[test]
+    fn a_pin_at_a_disabled_plugin_is_inert_and_warns() {
+        let decls = vec![
+            decl("a", &[("demo.text", "1.0.0")], &[]),
+            decl("b", &[("demo.text", "2.0.0")], &[]),
+        ];
+        let report = check_off(&decls, &slots(&[("demo.text", "b")]), &["b"]);
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.table["demo.text"].plugin, "a");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("`b`, which is disabled; the pin has no effect")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_pin_at_an_unconfigured_id_is_inert_and_warns() {
+        let decls = vec![decl("a", &[("demo.text", "1.0.0")], &[])];
+        let report = check_off(&decls, &slots(&[("demo.text", "typo")]), &[]);
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.table["demo.text"].plugin, "a");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("`typo`, which is not configured; the pin has no effect")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_pin_that_goes_inert_leaves_an_ambiguous_slot_an_error() {
+        let decls = vec![
+            decl("a", &[("demo.text", "1.0.0")], &[]),
+            decl("b", &[("demo.text", "1.0.0")], &[]),
+        ];
+        let report = check(&decls, &slots(&[("demo.text", "typo")]));
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        assert!(report.errors[0].message.contains("add capability"), "{report:?}");
+        assert!(report.table.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_pin_at_a_waiting_plugin_is_inert_and_warns() {
+        let decls = vec![
+            decl("a", &[("demo.text", "1.0.0")], &[]),
+            decl("b", &[("demo.text", "2.0.0")], &[("demo.store", "^1", false)]),
+        ];
+        let report = check(&decls, &slots(&[("demo.text", "b")]));
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert_eq!(report.blocked["b"], vec!["demo.store".to_string()]);
+        assert_eq!(report.table["demo.text"].plugin, "a");
+        assert!(
+            report.warnings.iter().any(|w| w.message.contains("`b`, which is blocked; the pin has no effect")),
+            "{report:?}"
+        );
     }
 }
 

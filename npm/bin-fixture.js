@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// .bin/eggshell-fixture: 替身插件，参数原样转给内核那侧的 fixture。
+// .bin/eggshell-fixture: the test double; arguments are passed through to the fixture in the kernel crate.
 import { spawnSync } from "node:child_process";
 
 import { fixture } from "./index.js";

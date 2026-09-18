@@ -48,6 +48,15 @@ pub mod reason {
     pub const CHECK: &str = "check";
 }
 
+/// Why a plugin's lifecycle changed. `boot` and `config` are the kernel's own
+/// paths; `source` and `manual` come from a host `restart`.
+pub mod trigger {
+    pub const BOOT: &str = "boot";
+    pub const CONFIG: &str = "config";
+    pub const SOURCE: &str = "source";
+    pub const MANUAL: &str = "manual";
+}
+
 pub use frame::{read_frame, write_frame, FrameError};
 pub use msg::{failure, notify, parse_frame, request, success, Incoming, RpcError};
 

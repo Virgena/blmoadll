@@ -1,0 +1,1 @@
+A plugin core with an unstable API that is subject to change at any time.

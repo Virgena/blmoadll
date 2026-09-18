@@ -1,18 +1,18 @@
-// 把内核二进制放进这个包的 bin/ —— 宿主 pnpm install 之后就有 eggshell 可用。
-// 找的顺序:
-//   1) 这个包 bin/ 里已经有了（重复安装是空操作，EGGSHELL_FORCE=1 可以重装）
-//   2) EGGSHELL_BIN 指的现成二进制（文件或目录）
-//   3) 仓库里已经构建好的 target/<profile>/
-//   4) 用 cargo 现建（要 Rust 工具链）
+// Put the kernel binaries into this package's bin/ so a host that ran pnpm install has
+// eggshell available. Lookup order:
+//   1) already in this package's bin/ (installing twice is a no-op; EGGSHELL_FORCE=1 reinstalls)
+//   2) the ready-made binary EGGSHELL_BIN points at (file or directory)
+//   3) an already built target/<profile>/ in the repository
+//   4) build one with cargo now (needs a Rust toolchain)
 //
-// EGGSHELL_PROFILE=debug 改偏好/构建的 profile（缺省 release）。
+// EGGSHELL_PROFILE=debug changes the preferred and built profile (release by default).
 import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-/** npm/ 的上一级 = cargo 工作区根（从这个仓库的 checkout 里安装时才有）。 */
+/** One level above npm/ is the cargo workspace root (present when installing from this repository's checkout). */
 const root = resolve(here, "..");
 const binDir = join(here, "bin");
 const exe = process.platform === "win32" ? ".exe" : "";
@@ -53,16 +53,16 @@ function fromCargo() {
   }
   const args = ["build", "-p", "eggshell-kernel", "--features", "fixture,host"];
   if (profile === "release") args.push("--release");
-  console.error(`eggshell-kernel: 没有现成的二进制，跑 cargo ${args.join(" ")}（第一次要几分钟）`);
+  console.error(`eggshell-kernel: no pre-built binary; running cargo ${args.join(" ")} (the first build takes a few minutes)`);
   const run = spawnSync("cargo", args, { cwd: root, stdio: "inherit", windowsHide: true });
   if (run.error || run.status !== 0) {
-    console.error(`eggshell-kernel: cargo 失败: ${run.error?.message ?? `exit ${run.status}`}`);
+    console.error(`eggshell-kernel: cargo failed: ${run.error?.message ?? `exit ${run.status}`}`);
     process.exit(1);
   }
   return join(root, "target", profile);
 }
 
-/** 硬链接优先: 同一块盘上不占第二份空间（debug 内核有 68 MiB）。 */
+/** Hard links first: no second copy on the same disk (a debug kernel is 68 MiB). */
 function place(source, name) {
   const target = join(binDir, name + exe);
   rmSync(target, { force: true });
@@ -75,7 +75,7 @@ function place(source, name) {
   return target;
 }
 
-/** 不带参数的 eggshell 会打 usage 并退 2 —— 跑得到就说明这份二进制是能执行的。 */
+/** A bare eggshell prints usage and exits 2; if it runs at all, the binary is executable. */
 function sanity(kernelPath) {
   const run = spawnSync(kernelPath, [], { encoding: "utf8", windowsHide: true });
   if (run.error) {
@@ -102,7 +102,7 @@ for (const bin of BINS) {
       console.error(`eggshell-kernel: ${source} There isn't any inside. ${bin.name}${exe}`);
       process.exit(1);
     }
-    console.error(`eggshell-kernel: Not found ${bin.name}${exe} —— The host can run; the fixture plugin needs to be built manually ("--features fixture").`);
+    console.error(`eggshell-kernel: Not found ${bin.name}${exe}. The host can run; the fixture plugin needs to be built manually ("--features fixture").`);
     continue;
   }
   place(source, bin.name);
