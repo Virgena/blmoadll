@@ -13,8 +13,8 @@ use std::process::ExitCode;
 use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
 
-use eggshell_protocol as proto;
-use eggshell_protocol::Incoming;
+use protocol as proto;
+use protocol::Incoming;
 
 const MAX_FRAME_BYTES: usize = 1 << 20;
 

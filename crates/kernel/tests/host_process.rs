@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-use eggshell_protocol::{read_frame, write_frame};
+use protocol::{read_frame, write_frame};
 
 const EGGSHELL: &str = env!("CARGO_BIN_EXE_eggshell");
 const FIXTURE: &str = env!("CARGO_BIN_EXE_eggshell-fixture");

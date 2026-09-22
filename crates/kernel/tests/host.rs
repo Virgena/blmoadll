@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use eggshell_kernel::{Host, Kernel};
-use eggshell_loader::Config;
+use kernel::{Host, Kernel};
+use loader::Config;
 
 const FIXTURE: &str = env!("CARGO_BIN_EXE_eggshell-fixture");
 
@@ -64,7 +64,7 @@ args = ["--provides", "{provides}"{extra}]
 async fn check_accepts_a_slot_that_is_provided() {
     let dir = scratch("check-ok");
     let path = config(&dir, &one_provider("demo.text=1.0.0", ""));
-    let report = eggshell_kernel::run(&path, true).await;
+    let report = kernel::run(&path, true).await;
     assert_eq!(report.code, 0, "{}", report.to_text());
     assert_eq!(report.start_order, vec!["provider".to_string()]);
     assert!(report.capabilities.contains_key("demo.text"));
@@ -80,7 +80,7 @@ command = '{FIXTURE}'
 [capability]
 "demo.text" = "provider"
 "#));
-    let report = eggshell_kernel::run(&path, true).await;
+    let report = kernel::run(&path, true).await;
     assert_eq!(report.code, 1);
     let text = report.to_text();
     assert!(text.contains("demo.text"), "{text}");

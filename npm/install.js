@@ -51,7 +51,7 @@ function fromCargo() {
     console.error("  Either set EGGSHELL_BIN to point to an eggshell executable, or install it from the eggshellmod checkout.");
     process.exit(1);
   }
-  const args = ["build", "-p", "eggshell-kernel", "--features", "fixture,host"];
+  const args = ["build", "-p", "kernel", "--features", "fixture,host"];
   if (profile === "release") args.push("--release");
   console.error(`eggshell-kernel: no pre-built binary; running cargo ${args.join(" ")} (the first build takes a few minutes)`);
   const run = spawnSync("cargo", args, { cwd: root, stdio: "inherit", windowsHide: true });

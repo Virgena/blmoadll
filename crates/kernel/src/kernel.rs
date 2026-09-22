@@ -14,15 +14,15 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch};
 
-use eggshell_protocol as proto;
-use eggshell_protocol::{codes, method, HOST, Incoming, RpcError};
+use protocol as proto;
+use protocol::{codes, method, HOST, Incoming, RpcError};
 
-use eggshell_loader::{Config, ConfigError, Limits, PluginSpec};
+use loader::{Config, ConfigError, Limits, PluginSpec};
 use crate::events::{Budget, EventBus};
-use eggshell_loader::graph::{self, Decl, Issue};
-use eggshell_loader::{to_json, RoutingTable};
+use loader::graph::{self, Decl, Issue};
+use loader::{to_json, RoutingTable};
 use crate::io::{self, Stdout};
-use eggshell_log as log;
+use logger as log;
 use crate::process::{self, Frames};
 
 /// Interval between polls of the shutdown flow, the sweeper and the reloader.

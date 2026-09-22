@@ -13,11 +13,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
-use eggshell_protocol as proto;
-use eggshell_protocol::{codes, Incoming, RpcError};
+use protocol as proto;
+use protocol::{codes, Incoming, RpcError};
 
-use eggshell_loader::{Limits, PluginSpec};
-use eggshell_log as log;
+use loader::{Limits, PluginSpec};
+use logger as log;
 
 /// Serializes one frame: `Content-Length: N\r\n\r\n<body>`.
 pub fn encode(value: &Value) -> Vec<u8> {

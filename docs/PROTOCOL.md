@@ -1,25 +1,25 @@
-# eggshellmod 线协议
+# The eggshellmod wire protocol
 
-本文写给要写插件的人 —— 尤其是用 TypeScript 写插件的人。读完这一篇，你不需要看 Rust 代码就能写出一个能加载、能被调用、能推流、能收发事件、能读写终端、能被干净关掉的插件。反过来，宿主侧（把内核当子进程拉起来、自己不写插件的那一头）见第 14 节。
+This document is for people who write plugins, especially plugins in TypeScript. After reading it you can write a plugin that loads, answers calls, streams, exchanges events, reads and writes the terminal, and shuts down cleanly, without reading any Rust. The other side, a host that runs the kernel as a child process and writes no plugins, is section 14.
 
-内核侧的事实基础: 内核只认能力 id、语义化版本和"该跟哪个进程说话"。它不知道 model / session / tool / UI 是什么，也不认你的插件是用什么语言写的。唯一的接口就是下面这套帧。
+What the kernel knows: capability ids, semantic versions, and which process to talk to. It does not know what a model, a session, a tool or a UI is, and it does not care what language your plugin is written in. The only interface is the framing below.
 
-标记约定: 写「必须」的是内核会强制检查的; 写「应当」的是内核不检查但会因此行为异常（例如超时、孤儿块）的。
+Conventions: "must" marks something the kernel enforces; "should" marks something the kernel does not check but that still misbehaves when you get it wrong (timeouts, orphaned chunks).
 
 ---
 
-## 0. 速览
+## 0. At a glance
 
-内核按配置文件里的 `command` / `args` 把你的插件当子进程拉起，然后在它的 fd 0 / fd 1 上讲 JSON-RPC:
+The kernel starts your plugin as a child process using `command` / `args` from the config file, then speaks JSON-RPC on its fd 0 / fd 1:
 
 ```
-内核拉起的子进程
-  fd 0 (stdin)   <- 内核发给你的帧
-  fd 1 (stdout)  -> 你发给内核的帧
-  fd 2 (stderr)  -> 日志，不是协议；按行转发到内核的 stderr
+the child process the kernel started
+  fd 0 (stdin)   <- frames the kernel sends you
+  fd 1 (stdout)  -> frames you send to the kernel
+  fd 2 (stderr)  -> logs, not protocol; forwarded line by line to the kernel's stderr
 ```
 
-一个帧长这样（头部 + 空行 + UTF-8 JSON 体）:
+A frame looks like this (header block + blank line + UTF-8 JSON body):
 
 ```
 Content-Length: 78\r\n
@@ -27,43 +27,43 @@ Content-Length: 78\r\n
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":1}}
 ```
 
-一个完整的回合:
+One complete round:
 
 ```
-内核 -> 你   initialize   你回 {protocol, provides, requires}
-内核 -> 你   start        你回 {}
-内核 -> 你   invoke       你回结果（或 {stream_id}）       <- 这里才是你的业务
-             互相推 $/stream/chunk、$/event、$/io/data
-内核 -> 你   shutdown     你回 {} 然后退出
+kernel -> you   initialize   you reply {protocol, provides, requires}
+kernel -> you   start        you reply {}
+kernel -> you   invoke       you reply with a result (or {stream_id})   <- your actual work
+                both ways: $/stream/chunk, $/event, $/io/data
+kernel -> you   shutdown     you reply {} and exit
 ```
 
-三条最容易踩的坑，先记住:
+Three traps worth memorising first:
 
-1. **stdout 上只能出现帧。** 任何 `console.log` / `printf` 调试都会破坏协议。日志写 stderr。
-2. **进程不能提前死。** 在 initialize 之后、shutdown 之前自己退出，等价于崩溃: 内核会把这个能力槽标成不可用。
-3. **流式回复必须先回 `{stream_id}` 再发块。** 顺序反了，块会被当成孤儿丢掉。
+1. **Only frames may appear on stdout.** Any `console.log` / `printf` debugging breaks the protocol. Write logs to stderr.
+2. **The process must not die early.** Exiting on your own after `initialize` and before `shutdown` is a crash: the kernel marks that capability slot unavailable.
+3. **A streamed reply sends `{stream_id}` first, then its chunks.** In the other order the chunks are orphaned and dropped.
 
 ---
 
-## 1. 传输与分帧
+## 1. Transport and framing
 
-采用 LSP 风格的分帧，只有 `Content-Length` 有意义。
+LSP-style framing; only `Content-Length` means anything.
 
-规则（这些是内核 `read_frame` / `write_frame` 的实际行为）:
+Rules (this is what the kernel's `read_frame` / `write_frame` actually do):
 
-- 头部是 `键: 值` 行，以 `\n` 结束，行尾的 `\r` 和空格被容忍。头部块以空行结束。
-- 只有 `Content-Length` 被解释；其他头部一律忽略。名字比较是不区分大小写的。
-- 值的两侧空白被 trim；解析不出数字就是坏帧。
-- **头部块上限 8 KiB**（所有头部行合计），单行也受 8 KiB 限制。超了算坏帧。
-- 帧体是 `Content-Length` 个字节的 UTF-8 JSON。
-- **帧体上限 `max_frame_bytes`，默认 64 MiB。** 超限是错误码 -32016: 内核不会回复你，而是判定这条管道作废、记一条 warning、把插件杀掉。也就是说 -32016 永远不会作为一条响应出现，只在日志 / 事件 / `--check` 里。
-- 帧体必须是 JSON **对象**。是 JSON 但不是对象（比如数组）算 -32600; 不是 JSON 算 -32700。
-- 头部块里没有 `Content-Length` = 坏帧，管道作废。
-- 帧与帧之间没有分隔符，可以背靠背连发。一帧写完必须 flush（内核自己每帧 flush）。
-- fd 0 在**帧边界处**读到干净 EOF 表示对端关闭 —— 这是插件的正常退出路径，退出码 0 即可。在头部读到一半时 EOF 是错误。
-- 内核按帧读，不按行读；你的输入不保证一次 `read` 就是一帧，必须自己缓冲拼帧。
+- Headers are `key: value` lines ending in `\n`; a trailing `\r` and padding spaces are tolerated. The header block ends at a blank line.
+- Only `Content-Length` is interpreted; every other header is ignored. Names are compared case-insensitively.
+- Values are trimmed; anything that does not parse as a number is a bad frame.
+- **The header block is capped at 8 KiB** (all header lines together), and a single line is capped at 8 KiB too. Over that is a bad frame.
+- The body is `Content-Length` bytes of UTF-8 JSON.
+- **The body is capped at `max_frame_bytes`, 64 MiB by default.** Over the cap is error code -32016: the kernel does not reply to you, it declares that pipe dead, logs a warning and kills the plugin. In other words -32016 never shows up as a response, only in logs, events and `--check`.
+- The body must be a JSON **object**. Valid JSON that is not an object (an array, say) is -32600; not JSON at all is -32700.
+- A header block with no `Content-Length` is a bad frame and kills the pipe.
+- Frames have no separator and may arrive back to back. Every frame must be flushed (the kernel flushes each one).
+- A clean EOF on fd 0 **at a frame boundary** means the peer closed: that is the plugin's normal exit path, exit code 0. EOF halfway through a header block is an error.
+- The kernel reads frames, not lines; your input is not guaranteed to deliver exactly one frame per `read`, so you must buffer and reassemble frames yourself.
 
-写（TypeScript，Node）:
+Writing (TypeScript, Node):
 
 ```ts
 import { writeSync } from "node:fs";
@@ -75,7 +75,7 @@ function send(message: unknown): void {
 }
 ```
 
-读（同一个循环负责拼帧）:
+Reading (the same loop reassembles frames):
 
 ```ts
 let buffer = Buffer.alloc(0);
@@ -84,13 +84,13 @@ process.stdin.on("data", (chunk: Buffer) => {
   buffer = Buffer.concat([buffer, chunk]);
   for (;;) {
     const split = buffer.indexOf("\r\n\r\n");
-    if (split < 0) return;                       // 头部还没齐
+    if (split < 0) return;                       // no complete header block yet
     const match = /content-length:\s*(\d+)/i.exec(
       buffer.subarray(0, split).toString("latin1"),
     );
     if (!match) throw new Error("missing Content-Length");
     const length = Number(match[1]);
-    if (buffer.length < split + 4 + length) return; // 体还没齐
+    if (buffer.length < split + 4 + length) return; // no complete body yet
     const payload = buffer.subarray(split + 4, split + 4 + length);
     buffer = buffer.subarray(split + 4 + length);
     handle(JSON.parse(payload.toString("utf8")));
@@ -98,45 +98,46 @@ process.stdin.on("data", (chunk: Buffer) => {
 });
 ```
 
-注意 `Content-Length` 计的是**字节数**，不是字符数 —— 中文和 emoji 必须用 `Buffer.byteLength` / `Buffer.from(...).length` 来算。用 `String.length` 会让内核读到半个字符。
+Note that `Content-Length` counts **bytes**, not characters: CJK text and emoji must be measured with `Buffer.byteLength` / `Buffer.from(...).length`. `String.length` makes the kernel read half a character.
 
 ---
 
-## 2. JSON-RPC 2.0 信封
+## 2. The JSON-RPC 2.0 envelope
 
-四种信封:
+Four envelopes:
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"invoke","params":{...}}          请求
-{"jsonrpc":"2.0","method":"$/event","params":{...}}                通知（无 id，或 id 为 null）
-{"jsonrpc":"2.0","id":7,"result":{...}}                            成功
-{"jsonrpc":"2.0","id":7,"error":{"code":-32010,"message":"..."}}    失败
+{"jsonrpc":"2.0","id":7,"method":"invoke","params":{...}}           request
+{"jsonrpc":"2.0","method":"$/event","params":{...}}                 notification (no id, or a null id)
+{"jsonrpc":"2.0","id":7,"result":{...}}                             success
+{"jsonrpc":"2.0","id":7,"error":{"code":-32010,"message":"..."}}    failure
 ```
 
-内核解析一个帧体的判定顺序（照抄 `parse_frame` 的实际逻辑）:
+The order in which the kernel classifies a body (copied from `parse_frame`):
 
-1. 必须是 JSON 对象，否则 -32700 / -32600。
-2. 有 `error` 字段 → 当成错误响应，缺 `id` 就当 null。
-3. 有 `method` 字段且 `id` 非 null → 请求; 有 `method` 但无 `id` 或 `id` 为 null → 通知。
-4. 没有 `method` 但有 `id` → 成功响应; `result` 缺失当 null。
-5. 既没有 `method` 也没有 `id` → -32600。
+1. It must be a JSON object, else -32700 / -32600.
+2. An `error` member makes it an error response; a missing `id` counts as null.
+3. A `method` member with a non-null `id` is a request; a `method` with no `id` or a null `id` is a notification.
+4. No `method` but an `id` is a success response; a missing `result` counts as null.
+5. Neither `method` nor `id` is -32600.
 
-关于 id:
+About ids:
 
-- 内核发给你的 id 是**数字**，在你这根管道上从 1 起单调递增。你回复时必须原样带回这个 id。
-- 你发给内核的 id 可以是数字或字符串; 内核原样回填。`"r-1"` 这种字符串 id 完全合法。
-- 两侧的 id 空间互相独立，不要混着用。
+- The ids the kernel sends you are **numbers**, increasing from 1 on your pipe. Your reply must carry the same id back.
+- Ids you send the kernel may be numbers or strings; the kernel echoes them unchanged. A string id such as `"r-1"` is perfectly legal.
+- The two id spaces are independent; do not mix them.
 
-`params` 和 `result` 对内核是不透明的 —— 除了它自己读的那几个字段（`capability` / `method` / `params` / `meta` 等），其余内容原样转发。
+`params` and `result` are opaque to the kernel: apart from the few members it reads itself (`capability` / `method` / `params` / `meta`), everything is forwarded unchanged.
+
 ---
 
-## 3. 内核发给插件
+## 3. The kernel to the plugin
 
-内核只发四个请求: `initialize` / `start` / `invoke` / `shutdown`。其余都是通知。
+The kernel sends only four requests: `initialize` / `start` / `invoke` / `shutdown`. Everything else is a notification.
 
-### 3.1 initialize（请求，必须应答）
+### 3.1 initialize (request, must be answered)
 
-内核在进程起来后立刻发。params:
+The kernel sends it as soon as the process is up. params:
 
 ```json
 {
@@ -147,23 +148,20 @@ process.stdin.on("data", (chunk: Buffer) => {
 }
 ```
 
-| 字段 | 含义 |
+| field | meaning |
 |---|---|
-| `protocol` | 内核的协议版本，当前是 1 |
-| `plugin_id` | 你在配置文件里的 id |
-| `kernel_version` | 内核 crate 的版本字符串，仅用于日志/诊断 |
-| `config` | 配置文件里 `[plugins.<id>.config]` 那张表的原样 JSON; 没写就是 `{}` |
+| `protocol` | the kernel's protocol version, currently 1 |
+| `plugin_id` | the id you have in the config file |
+| `kernel_version` | the version string of the kernel crate, for logs and diagnostics only |
+| `config` | the verbatim JSON of the `[plugins.<id>.config]` table in the config file; `{}` when absent |
 
-这一节的内容就是你的"启动参数"。配置里放什么完全由你和写配置的人约定，内核不看。
+This section is your "startup parameters". What goes in the config is entirely an agreement between you and whoever writes the config; the kernel does not look at it.
 
-内核确实不看: 这张表是不透明 JSON，它不校验键。**读哪几个键是插件自己的事** ——
-plugin-kit 里 `Definition.configKeys` 就是插件对这件事的声明，initialize 时它把
-`config` 里多出来的键按 §4.4 记一条 warn（只要有一条就报，只报不拦: 配置可能比插件
-新，那是升级顺序，不是错误）。不声明 `configKeys` = 整个跳过检查。
+It genuinely does not: the table is opaque JSON and its keys are not validated. **Which keys to read is the plugin's business**: in plugin-kit that declaration is `Definition.configKeys`, and on initialize it records one warn per extra key in `config` following §4.4 (one is enough to report, and it only reports: the config may be newer than the plugin, which is an upgrade order, not an error). Declaring no `configKeys` skips the check entirely.
 
-你必须在 `initialize_timeout_ms`（默认 5000，可在 `[plugins.<id>]` 里覆盖）内回复。超时 = 启动失败。
+You must reply within `initialize_timeout_ms` (default 5000, overridable under `[plugins.<id>]`). A timeout means the startup failed.
 
-result 必须包含:
+result must contain:
 
 ```json
 {
@@ -173,37 +171,37 @@ result 必须包含:
 }
 ```
 
-| 字段 | 必须 | 说明 |
+| field | required | notes |
 |---|---|---|
-| `protocol` | 是 | 必须等于 1。不等就是 -32015，内核启动失败，并说明"你说协议 N，内核说 1" |
-| `provides` | 是 | 数组。每一项必须有 `capability` 和 `version` |
-| `requires` | 是 | 数组。每一项必须有 `capability` 和 `version`，`optional` 缺省 false |
+| `protocol` | yes | must equal 1. Anything else is -32015, the kernel startup fails, and it says "you claim protocol N, the kernel says 1" |
+| `provides` | yes | array. Every entry needs `capability` and `version` |
+| `requires` | yes | array. Every entry needs `capability` and `version`; `optional` defaults to false |
 
-- `provides[].version` 必须是**完整 semver**（`1.0.0`），因为内核要用它去满足别人的 range。
-- `requires[].version` 必须是 **semver range**（`^1`、`>=1.2, <2`）。
-- 版本字符串不合法是启动错误，不是警告。
-- `provides` / `requires` 缺任何一个都是错误（错误信息分别是 "initialize reply has no `provides` array" / "no `requires` array"）。
-- `optional: true` 的依赖找不到提供方时只记警告并跳过（不会拦住启动）; 必需依赖找不到、版本不满足、或依赖成环都是启动失败。
-- result 里其他字段被忽略。内核只用 `provides` / `requires` 建路由表和拓扑序。
+- `provides[].version` must be a **complete semver** (`1.0.0`), because the kernel uses it to satisfy other plugins' ranges.
+- `requires[].version` must be a **semver range** (`^1`, `>=1.2, <2`).
+- An invalid version string is a startup error, not a warning.
+- Missing either `provides` or `requires` is an error (the messages are "initialize reply has no `provides` array" / "no `requires` array").
+- A `optional: true` dependency with no provider only logs a warning and is skipped (it does not block startup); a required dependency that is missing, whose version does not match, or that forms a cycle fails startup.
+- Other fields in result are ignored. The kernel builds the routing table and the topological order from `provides` / `requires` alone.
 
-依赖语义值得说清楚: `requires` 声明的是"我需要另一个能力存在且版本满足"，它决定**启动顺序**（你的 start 会在依赖的 start 之后被调用），并不阻止你在运行期调用任何能力 —— 运行期调用只受路由表约束。
+The dependency semantics are worth stating plainly: `requires` says "I need another capability to exist at a matching version". It decides **startup order** (your start is called after the start of what you depend on) and does not prevent you from calling any capability at runtime; runtime calls are bounded by the routing table only.
 
-### 3.2 start（请求，必须应答）
+### 3.2 start (request, must be answered)
 
-依赖全部就绪后按拓扑序调用。params:
+Called in topological order once every dependency is ready. params:
 
 ```json
 {"capabilities": {"demo.text": {"plugin": "provider", "version": "1.0.0"}}}
 ```
 
-- 这是**整张路由表的快照**，按能力 id 排序。它是出发点，不是承诺: 之后的变化通过 `kernel.capabilities.changed` 事件到达。
-- 在这里做"依赖别人的能力"的准备工作最合适 —— 依赖的 `start` 已经返回了。
-- 超时 `start_timeout_ms`（默认 10000）。
-- result 内容被忽略，回 `{}` 即可。
-- `start` 成功后内核发布 `kernel.plugin.started`。
-- `--check`（配置体检）**不会**调用 `start`，也不会产生任何生命周期事件。
+- This is a **snapshot of the whole routing table**, sorted by capability id. It is a starting point, not a promise: later changes arrive as `kernel.capabilities.changed` events.
+- This is the right place to prepare for "using someone else's capability"; the `start` of what you depend on has already returned.
+- Timeout `start_timeout_ms` (default 10000).
+- The result is ignored; reply `{}`.
+- After `start` succeeds the kernel publishes `kernel.plugin.started`.
+- `--check` (config check) does **not** call `start` and produces no lifecycle events at all.
 
-### 3.3 invoke（请求，必须应答）—— 你的业务入口
+### 3.3 invoke (request, must be answered): your business entry point
 
 params:
 
@@ -221,72 +219,75 @@ params:
 }
 ```
 
-| meta 字段 | 说明 |
+| meta field | notes |
 |---|---|
-| `caller` | 调用方标签。要么是某个插件的 id，要么是 `"host"` |
-| `request_id` | 内核在这根管道上的调用号，是**数字**。它和你的 `$/cancel` 通知对应 |
-| `timeout_ms` | 内核已经为这次调用设好的超时; 超时后调用方拿到 -32012，你会收到 `$/cancel` |
-| `stream` | true 表示流式调用，见第 7 节 |
+| `caller` | caller label. Either the id of a plugin or `"host"` |
+| `request_id` | the kernel's call number on this pipe, a **number**. It matches your `$/cancel` notifications |
+| `timeout_ms` | the timeout the kernel already set for this call; after it the caller gets -32012 and you get `$/cancel` |
+| `stream` | true means a streaming call, see section 7 |
 
-`"host"` 是保留标识: 它代表嵌入内核的那个宿主（编辑器 / 上层应用）。宿主是**纯调用方** —— 它不提供能力、没有进程、不能当路由目标。配置文件里定义 `plugins.host` 会被拒绝。
+`"host"` is a reserved label: it stands for the host embedding the kernel (an editor or an application). The host is a **pure caller**: it provides no capabilities, has no process, and cannot be a routing target. Defining `plugins.host` in the config file is rejected.
 
-result 是你给的任意 JSON，原样回给调用方。流式调用时必须回 `{"stream_id": "<你自己起的名字>"}`。
+result is any JSON you like, returned to the caller unchanged. On a streaming call it must be `{"stream_id": "<a name you pick>"}`.
 
-注意方向: 这里 `meta.request_id` 是数字（内核编号），而**你反向调用内核时** `meta.request_id` 必须是字符串（你自己的请求 id）。这不是笔误，是两条独立的方向（见 4.1）。
+Mind the direction: here `meta.request_id` is a number (the kernel's numbering), while **when you call back into the kernel** `meta.request_id` must be a string (your own request id). That is not a typo, it is two independent directions (see 4.1).
 
-### 3.4 shutdown（请求，必须应答）
+### 3.4 shutdown (request, must be answered)
 
 ```json
 {"reason": "kernel_exit"}
 ```
 
-| reason | 何时 |
+| reason | when |
 |---|---|
-| `kernel_exit` | 宿主要退出了 / 内核的 stdin 到了 EOF |
-| `reload` | 热重载把你换掉了（或重载失败要回滚） |
-| `ui_quit` | 用户/宿主主动要求退出 |
-| `check` | `--check` 体检收尾 |
+| `kernel_exit` | the host is exiting / the kernel's stdin hit EOF |
+| `reload` | a hot reload replaced you (or a failed reload rolls back) |
+| `ui_quit` | the user or host asked to quit |
+| `check` | the `--check` run is wrapping up |
 
-这四个是能给出的全部。宿主只能挑 `ui_quit`（默认）和 `kernel_exit`，`reload` 和 `check` 是内核自己的说法（见 14.2）。
+Those four are all there is. A host can only pick `ui_quit` (the default) and `kernel_exit`; `reload` and `check` are the kernel's own words (see 14.2).
 
-**你必须对所有 reason 表现一致。** 它们只用于日志和指标，不是让你按 reason 分支的。
+**You must behave identically for every reason.** They exist for logs and metrics, not so you can branch on them.
 
-做法: 回复 `{}`，然后自己退出。`shutdown_grace_ms`（默认 5000）内没退出会被强杀，内核的退出码会变成 2。回复之后不要再去接新活。
+What to do: reply `{}`, then exit on your own. If you have not exited within `shutdown_grace_ms` (default 5000) you are killed and the kernel's exit code becomes 2. Do not pick up new work after replying.
 
-### 3.5 内核发给插件的通知
+### 3.5 Kernel-to-plugin notifications
 
-| 方法 | params | 何时 |
+| method | params | when |
 |---|---|---|
-| `$/event` | `{topic, seq, payload}` | 你订阅的主题有事件 |
-| `$/stream/chunk` | `{stream_id, seq, data, done}` | 你当调用方时的流式块 |
-| `$/stream/error` | `{stream_id, code, message, data}` | 你的流以错误结束 |
-| `$/cancel` | `{request_id}` | 你发出的调用被取消 |
-| `$/io/data` | `{stream:"stdin", data, eof}` | 你 attach 了 stdin |
-| `$/io/detached` | `{stream:"stdin", reason:"taken_over"}` | 别人抢走了 stdin |
+| `$/event` | `{topic, seq, payload}` | a topic you subscribed to has an event |
+| `$/stream/chunk` | `{stream_id, seq, data, done}` | a stream chunk for a call you made |
+| `$/stream/error` | `{stream_id, code, message, data}` | your stream ended with an error |
+| `$/cancel` | `{request_id}` | a call you made was cancelled |
+| `$/io/data` | `{stream:"stdin", data, eof}` | you attached stdin |
+| `$/io/detached` | `{stream:"stdin", reason:"taken_over"}` | someone else took stdin |
 
-通知没有 id，不要回复; 回了内核会当成一个未知方法的请求处理。
+Notifications have no id and must not be answered; answering one makes the kernel treat it as a request for an unknown method.
+
 ---
 
-## 4. 插件发给内核
+---
 
-| 方法 | 类型 | 作用 |
+## 4. The plugin to the kernel
+
+| method | type | what it does |
 |---|---|---|
-| `kernel.invoke` | 请求 | 调用别人的能力 |
-| `kernel.publish` | 请求 | 发事件 |
-| `kernel.subscribe` | 请求 | 订阅主题 |
-| `kernel.unsubscribe` | 请求 | 取消订阅 |
-| `kernel.attach` | 请求 | 取得 stdin / stdout |
-| `kernel.detach` | 请求 | 释放 stdin / stdout |
-| `kernel.write` | 请求 | 写宿主 stdout |
-| `kernel.shutdown` | 请求 | 要求整机下线 |
-| `kernel.log` | 通知 | 结构化日志（无回复） |
-| `$/stream/chunk` | 通知 | 你是提供方，推一块数据 |
-| `$/stream/error` | 通知 | 你是提供方，流以错误结束 |
-| `$/cancel` | 通知 | 取消你发出的调用 |
+| `kernel.invoke` | request | call someone else's capability |
+| `kernel.publish` | request | publish an event |
+| `kernel.subscribe` | request | subscribe to a topic |
+| `kernel.unsubscribe` | request | cancel a subscription |
+| `kernel.attach` | request | take stdin / stdout |
+| `kernel.detach` | request | release stdin / stdout |
+| `kernel.write` | request | write to the host's stdout |
+| `kernel.shutdown` | request | ask the whole kernel to go down |
+| `kernel.log` | notification | structured log (no reply) |
+| `$/stream/chunk` | notification | you are the provider, push a chunk |
+| `$/stream/error` | notification | you are the provider, the stream failed |
+| `$/cancel` | notification | cancel a call you made |
 
-内核不认识的方法一律回 -32601。
+Any method the kernel does not recognise gets -32601.
 
-### 4.1 kernel.invoke（请求）
+### 4.1 kernel.invoke (request)
 
 ```json
 {
@@ -302,77 +303,77 @@ result 是你给的任意 JSON，原样回给调用方。流式调用时必须�
 }
 ```
 
-| meta 字段 | 必须 | 说明 |
+| meta field | required | notes |
 |---|---|---|
-| `request_id` | **是** | 必须是**字符串**。缺了或不是字符串 → -32602。没有它你就无法取消这次调用 |
-| `stream` | 否 | 缺省 false。true 表示你要一条流 |
-| `timeout_ms` | 否 | 缺省用提供方插件的 `request_timeout_ms` |
+| `request_id` | **yes** | must be a **string**. Missing or not a string is -32602. Without it you cannot cancel the call |
+| `stream` | no | defaults to false. true means you want a stream |
+| `timeout_ms` | no | defaults to the provider plugin's `request_timeout_ms` |
 
-约定: `request_id` 建议和你这次请求的 `id` 用同一个值 —— 内核就是靠 `(调用方, request_id)` 这个键把你的 `$/cancel` 映射到对方的调用上的。
+Convention: use the same value for `request_id` and this request's `id`; the kernel maps your `$/cancel` onto the other side's call through the `(caller, request_id)` key.
 
-result: 提供方的结果。流式调用时是 `{"stream_id": "f-N"}` —— 这个名字是**内核起的**，不是你起的（方向反过来时才是你起名，见第 7 节）。
+result: the provider's result. On a streaming call it is `{"stream_id": "f-N"}`: the kernel picks that name, not you (the direction is reversed only for streams you provide, see section 7).
 
-你会遇到的错误:
+Errors you can hit:
 
-| code | 什么时候 |
+| code | when |
 |---|---|
-| -32010 | 没有任何插件提供这个能力 id |
-| -32011 | 提供方已退出 / 不可用; `data` 里有 `{plugin, exit_code, signal}` |
-| -32012 | 超时（`"`capability/method`" timed out"`） |
-| -32014 | 提供方还活着但没 `start` |
-| -32019 | 你或全局的并发上限到顶 |
+| -32010 | no plugin provides this capability id |
+| -32011 | the provider has exited / is unavailable; `data` holds `{plugin, exit_code, signal}` |
+| -32012 | timeout (`"`capability/method`" timed out"`) |
+| -32014 | the provider is alive but has not `start`ed |
+| -32019 | your concurrency limit or the global one is full |
 
-### 4.2 kernel.publish（请求）
+### 4.2 kernel.publish (request)
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"kernel.publish",
  "params":{"topic":"demo.turn","payload":{"n":1}}}
 ```
 
-result 是 `{}`。
+result is `{}`.
 
-- `topic` 不能以 `kernel.` 开头 —— 那个前缀保留给内核，违规是 -32602，`error.data.reason` 为 `"reserved_topic"`。
-- `payload` 序列化后不能超过 `event_payload_bytes`（默认 256 KiB），否则 -32020。
-- 发布是"发射后不管": 没有投递回执，也不知道有几个订阅者。
+- `topic` must not start with `kernel.`: that prefix is reserved for the kernel, and a violation is -32602 with `error.data.reason` set to `"reserved_topic"`.
+- `payload` must not serialise past `event_payload_bytes` (default 256 KiB), else -32020.
+- Publishing is fire and forget: there is no delivery receipt and no count of subscribers.
 
-### 4.3 kernel.subscribe / kernel.unsubscribe（请求）
+### 4.3 kernel.subscribe / kernel.unsubscribe (requests)
 
 ```json
 {"method":"kernel.subscribe","params":{"patterns":["demo.*","kernel.plugin.*"]}}
 → {"subscription_id":"sub-7"}
 ```
 
-- `patterns` 不能是空数组，否则 -32602。
-- 一个订阅可以有多个图案; 只要有一个匹配就会收到事件。
-- 取消:
+- `patterns` must not be an empty array, else -32602.
+- One subscription may carry several patterns; any match delivers the event.
+- To cancel:
 
 ```json
 {"method":"kernel.unsubscribe","params":{"subscription_id":"sub-7"}}
 → {}
 ```
 
-未知的订阅 id 是 -32021。**插件退出时它的全部订阅自动失效**，内核会清掉，你不用（也来不及）自己去注销。
+An unknown subscription id is -32021. **All of a plugin's subscriptions die with it**; the kernel clears them, so you neither have to nor get the chance to unsubscribe yourself.
 
-### 4.4 kernel.log（通知，无回复）
+### 4.4 kernel.log (notification, no reply)
 
 ```json
 {"jsonrpc":"2.0","method":"kernel.log",
  "params":{"level":"info","message":"loaded 3 tools","fields":{"count":3}}}
 ```
 
-| 字段 | 说明 |
+| field | notes |
 |---|---|
-| `level` | `error` / `warn` / `info` / `debug`; 其他值按 debug 处理 |
-| `message` | 人读的字符串，缺省空串 |
-| `fields` | 任意 JSON 对象，缺省 `{}`; 会被摊平进日志行 |
+| `level` | `error` / `warn` / `info` / `debug`; anything else is treated as debug |
+| `message` | human-readable string, defaults to the empty string |
+| `fields` | any JSON object, defaults to `{}`; flattened into the log line |
 
-内核会补上 `plugin` 字段（你的 id），把整行写进它自己的 stderr（一行一个 JSON 对象，`target` 为 `"plugin"`）。超过 `log_line_bytes`（默认 8 KiB）的行会被丢弃并记一条 warning。低于当前 verbosity 的级别会被过滤掉。
+The kernel adds the `plugin` field (your id) and writes the line to its own stderr (one JSON object per line, `target` set to `"plugin"`). A line past `log_line_bytes` (default 8 KiB) is dropped and a warning is recorded. Levels below the current verbosity are filtered out.
 
-这是**唯一**推荐的日志通道。直接往 stderr 写原样文本也能被转发（内核按行读你的 stderr，`target` 为 `"plugin.stderr"`，带 `plugin` 字段，按 `log_line_bytes` 截断），但结构化通道更好检索。
+This is the **only** recommended logging channel. Writing plain text to stderr is forwarded too (the kernel reads your stderr line by line with `target` `"plugin.stderr"`, adds the `plugin` field, and truncates at `log_line_bytes`), but the structured channel is easier to search.
 
-再强调一次: 日志不要写 stdout，那是协议。
+Once more: do not log to stdout, that is the protocol.
 
-### 4.5 io 原语（请求）
+### 4.5 The io primitives (requests)
 
 ```json
 {"method":"kernel.attach","params":{"stream":"stdin","mode":"line"}}  → {}
@@ -380,99 +381,105 @@ result 是 `{}`。
 {"method":"kernel.write","params":{"stream":"stdout","data":"..."}}   → {}
 ```
 
-细节在第 9 节。`stream` 只认 `"stdin"` 和 `"stdout"`，其他值是 -32602。
+Details are in section 9. `stream` accepts only `"stdin"` and `"stdout"`; anything else is -32602.
 
-### 4.6 kernel.shutdown（请求）
+### 4.6 kernel.shutdown (request)
 
-请求整机下线。内核会**先回 `{}`** 再开始统一关机流程（reason 记为 `ui_quit`）。
+Asks the whole kernel to go down. The kernel replies `{}` **first** and then starts the unified shutdown (reason recorded as `ui_quit`).
 
-### 4.7 插件发给内核的通知
+### 4.7 Plugin-to-kernel notifications
 
-| 方法 | params | 说明 |
+| method | params | notes |
 |---|---|---|
-| `$/stream/chunk` | `{stream_id, seq, data, done}` | 你是提供方，推一块 |
-| `$/stream/error` | `{stream_id, code, message, data}` | 你是提供方，流失败了 |
-| `$/cancel` | `{stream_id}` 或 `{request_id}` | 放弃你自己发出的调用 |
+| `$/stream/chunk` | `{stream_id, seq, data, done}` | you are the provider, push a chunk |
+| `$/stream/error` | `{stream_id, code, message, data}` | you are the provider, the stream failed |
+| `$/cancel` | `{stream_id}` or `{request_id}` | give up a call you made |
 
-`$/cancel` 两个字段任选其一: `stream_id` 取消你当调用方的流（内核会连带取消提供方），`request_id` 取消你用 `kernel.invoke` 发出的那次调用（用你当初写的那个字符串 id）。取消是**协作式**的: 内核会停止转发、给提供方发 `$/cancel`，但它无法强制对方停工。
+`$/cancel` takes one of the two fields: `stream_id` cancels a stream where you are the caller (the kernel cancels the provider along with it), `request_id` cancels a call you made with `kernel.invoke` (using the string id you wrote). Cancellation is **cooperative**: the kernel stops forwarding and sends `$/cancel` to the provider, but it cannot force the other side to stop working.
+
 ---
 
-## 5. 生命周期与退出
+## 5. Lifecycle and exit
 
 ```
-内核                                          插件进程
+kernel                                        plugin process
  │  spawn(command, args, cwd, env)             │
- │ ──────────────────────────────────────────► │  起来，开始读 fd 0
+ │ ──────────────────────────────────────────► │  up, starts reading fd 0
  │                                             │
  │  initialize {protocol,plugin_id,config} ──► │
  │ ◄──────────────── {protocol,provides,requires}
  │                                             │
- │  （校验依赖图 + 算拓扑序；有错就整机启动失败） │
+ │  (validate the dependency graph + order it; │
+ │   any error fails the whole startup)        │
  │                                             │
- │  start {capabilities} ────────────────────► │   按拓扑序，依赖在前
+ │  start {capabilities} ────────────────────► │   in topological order, deps first
  │ ◄──────────────── {}                        │
  │                                             │
- │  invoke / $/event / $/stream/chunk  ◄─────► │   正常工作期
+ │  invoke / $/event / $/stream/chunk  ◄─────► │   normal operation
  │                                             │
  │  shutdown {reason} ───────────────────────► │
  │ ◄──────────────── {}                        │
- │                                             │  自己退出
- │  等 shutdown_grace_ms；没退就强杀 → 退出码 2  │
+ │                                             │  exits on its own
+ │  wait shutdown_grace_ms; else kill → exit 2 │
 ```
 
-顺序是死的: `initialize` → `start` → 工作 → `shutdown`。
+The order is fixed: `initialize` → `start` → work → `shutdown`.
 
-- `start` 之前不会有 `invoke` 打到你身上（路由表建立之前内核不发调用）。
-- 你想主动停止，就自己退出 —— 但注意下一段。
+- No `invoke` reaches you before `start` (the kernel sends no calls before the routing table exists).
+- To stop on your own initiative, exit yourself, but read the next part first.
 
-### 插件意外退出
+### A plugin exiting unexpectedly
 
-在 initialize 之后、内核要求你 shutdown 之前自己退出，等于**崩溃**。内核的反应:
+Exiting after initialize but before the kernel asks you to shut down counts as a **crash**. What the kernel does:
 
-1. 所有还在等你回复的调用立刻拿到 -32011，`error.data` 是 `{plugin, exit_code, signal}`。
-2. 你作为提供方的那些流被终止，调用方收到 -32011 的 `$/stream/error`。
-3. 你作为调用方的那些流被清掉。
-4. 发事件 `kernel.plugin.degraded`，然后 `kernel.plugin.stopped`，`payload.reason` 是 `"crash"`。
-5. **你的能力槽保留。** 后续调用那个能力仍然得到 -32011，不会偷偷落到别的插件上 —— 这是有意的: 静默改路由比报错更糟。
+1. Every call still waiting for your reply immediately gets -32011 with `error.data` `{plugin, exit_code, signal}`.
+2. The streams where you are the provider are terminated; callers get a -32011 `$/stream/error`.
+3. The streams where you are the caller are cleared.
+4. It emits `kernel.plugin.degraded` and then `kernel.plugin.stopped` with `payload.reason` set to `"crash"`.
+5. **Your capability slots stay.** Later calls to those capabilities still get -32011 rather than quietly landing on another plugin, deliberately: a silent reroute is worse than an error.
 
-内核自己不会因为插件死掉而退出，其他插件也不受影响。
+The kernel does not exit because a plugin died, and other plugins are unaffected.
 
-### 内核的退出码
+### The kernel's exit codes
 
-| 码 | 含义 |
+| code | meaning |
 |---|---|
-| 0 | 干净: 所有插件都在 grace 内自己退了，也没有调用被丢下 |
-| 2 | 有插件被强杀，或有调用在 drain 预算（`drain_ms`，默认 5000）内没跑完 |
+| 0 | clean: every plugin exited on its own within grace, and no call was left behind |
+| 2 | a plugin was killed, or a call did not finish within the drain budget (`drain_ms`, default 5000) |
+| 1 | could not come up: the config was unreadable, or readable but unbootable |
 
-### 关机的内部顺序（你可以依赖它）
+### The internal shutdown order (you may rely on it)
 
-1. **drain**: 等在飞的调用跑完，直到 0 个在飞且安静了 `io_eof_idle_ms`（默认 500）; 或到 `drain_ms` 截止。
-2. 给每个插件发 `shutdown{reason}`。
-3. 等 `shutdown_grace_ms`（默认 5000，取所有插件的最大值）。
-4. 强杀剩下的，然后内核退出。
+1. **drain**: wait for in-flight calls to finish, until there are zero in flight and things have been quiet for `io_eof_idle_ms` (default 500), or until `drain_ms` is up.
+2. Send `shutdown{reason}` to every plugin.
+3. Wait `shutdown_grace_ms` (default 5000, the largest value among plugins).
+4. Kill whatever is left, then the kernel exits.
 
-所以: 收到 `shutdown` 后你有 5 秒左右。要落盘、要关连接，现在做，别拖。
+So: after `shutdown` you have about 5 seconds. Flush to disk and close connections now, not later.
 
 ---
 
-## 6. 能力调用与路由
+## 6. Capability calls and routing
 
-- 能力 id 是**不透明字符串**。内核不知道 `"demo.text"` 是什么意思，只知道它归哪个插件、版本多少。名字由你和写配置的人约定。
-- 路由表由插件的 `provides` 推导: 你在 `initialize` 里声明了哪些能力，配置里就自动有哪些槽，不必在配置文件中再抄一遍。声明了就是可调的 —— 要下线一个能力，把提供它的插件从配置里去掉。
-- `[capability]` 只在有歧义时用: 两个被配置的插件声明同一个能力时报错，那一条 pin（能力 id -> 插件 id）指明由谁提供；pin 指向一个不提供该能力的插件同样启动失败。
-- 一个能力 id 只有一个提供方。没有优先级、没有故障转移、没有负载均衡 —— 要换提供方就改配置（或热重载）。
-- 热重载时**整张表被替换**（不是改单条路由），插件通过 `kernel.capabilities.changed` 拿到新表。这意味着: 永远用能力 id 发起调用，不要在本地缓存"哪个插件"，那样在重载后会指向旧世界。
-- 调用方标签由内核写死，调用方自己说的不算: 插件调用时是插件 id，宿主调用时是 `"host"`。你不能冒充别的调用方。
-- 并发: 每个插件 `max_inflight`（默认 64），全局 `max_inflight_total`（默认 1024）。超了直接 -32019，**不排队** —— 内核宁可让调用方知道自己把对方压垮了，也不悄悄堆队列。
-- 内核不重试。要重试是调用方的决定。
-- 只有在提供方已经退出或还没 `start` 时才会立刻失败（-32011 / -32014）。
+- A capability id is an **opaque string**. The kernel has no idea what `"demo.text"` means, only which plugin owns it and at what version. The names are an agreement between you and whoever writes the config.
+- The routing table is derived from the plugins' `provides`: whatever you declare in `initialize` automatically has a slot in the config, so there is nothing to copy into the config file. Declared means callable; to retire a capability, drop the plugin providing it from the config.
+- A plugin whose required capabilities nobody serves **does not start**. It is spawned and initialized, then held back in a waiting state: its `provides` are not in the table and its own capabilities answer -32010, until a reload brings a provider in (§8.6). Plugins that require what it provides wait in turn, and the kernel says who waits for what through `kernel.plugin.blocked` (§8.5). A plugin held back like that is still a plugin the kernel knows about: it keeps its process and its declaration, and it is started the moment the slot it waits for exists.
+- One provider per capability id. No priorities, no failover, no load balancing; to change providers, change the config (or hot reload).
+- A hot reload **replaces the whole table** (not single routes), and plugins get the new table through `kernel.capabilities.changed`. Which means: always call by capability id and never cache "which plugin" locally, or you will be pointing at the old world after a reload.
+- The caller label is written by the kernel and the caller's own claim does not count: a plugin call carries the plugin id, a host call carries `"host"`. You cannot impersonate another caller.
+- Concurrency: `max_inflight` per plugin (default 64) and `max_inflight_total` globally (default 1024). Past either you get -32019 straight away, **no queueing**, because the kernel would rather a caller learns it is crushing the other side than silently grows a backlog.
+- The kernel does not retry. Retrying is the caller's decision.
+- Failures are immediate only when the provider has exited or has not `start`ed yet (-32011 / -32014). A waiting plugin is not a provider at all: `invoke` on a capability it would have offered gets -32010 (unknown capability), because the slot is not in the table.
+
 ---
 
-## 7. 流
+---
 
-一次调用要么是一问一答，要么是一条流。流是**同一条管道上的通知序列**，不是新的连接。
+## 7. Streams
 
-### 7.1 你当调用方
+A call is either one question and one answer, or one stream. A stream is a **sequence of notifications on the same pipe**, not a new connection.
+
+### 7.1 You as the caller
 
 ```json
 {"id":"r-1","method":"kernel.invoke",
@@ -481,298 +488,329 @@ result 是 `{}`。
 → {"id":"r-1","result":{"stream_id":"f-3"}}
 ```
 
-然后:
+Then:
 
 ```json
 {"method":"$/stream/chunk","params":{"stream_id":"f-3","seq":0,"data":{"delta":"c0"},"done":false}}
 {"method":"$/stream/chunk","params":{"stream_id":"f-3","seq":1,"data":null,"done":true}}
 ```
 
-要点:
+The points that matter:
 
-- `stream_id` 是**内核起的名字**（`f-N`），不是你起的。先拿到它，再等块。
-- **`seq` 是内核从 0 重新编号的**，提供方自己的 seq 不外传。你只需要按 seq 递增消费，并靠 `done` 判断结束。
-- 结束有且只有一个终止块: 要么 `done:true`（`data` 必为 null），要么一条 `$/stream/error{stream_id, code, message, data}`。
-- 你也可以主动放弃: 发 `$/cancel{stream_id: "f-3"}`。
+- `stream_id` is **a name the kernel made up** (`f-N`), not yours. Get it first, then wait for chunks.
+- **`seq` is renumbered by the kernel from 0**; the provider's own seq does not travel. You only consume in increasing seq and read `done` for the end.
+- There is exactly one terminal chunk: either `done:true` (with `data` necessarily null) or a `$/stream/error{stream_id, code, message, data}`.
+- You can also give up early: send `$/cancel{stream_id: "f-3"}`.
 
-### 7.2 你当提供方
+### 7.2 You as the provider
 
-收到 `invoke` 且 `meta.stream` 为 true 时:
+When an `invoke` arrives with `meta.stream` true:
 
-1. **先回** `{"stream_id": "<你的名字>"}`。这一步**不能省，也不能后置** —— 内核靠这次响应建立 `(你, 你的 stream_id)` → 调用方 stream 的映射。在它之前发的块会被当作孤儿丢掉（内核记一条 warning "sent a chunk for unknown stream"）。
-2. 再发任意多块:
+1. **Reply first** with `{"stream_id": "<your name>"}`. This step **cannot be skipped or deferred**: the kernel builds the `(you, your stream_id)` to caller-stream mapping from that reply. Chunks sent before it are discarded as orphans (the kernel records a "sent a chunk for unknown stream" warning).
+2. Then send any number of chunks:
 
 ```json
 {"method":"$/stream/chunk",
  "params":{"stream_id":"s-1","seq":0,"data":{"delta":"hel"},"done":false}}
 ```
 
-3. 收尾: `{"stream_id":"s-1","seq":1,"data":null,"done":true}`。**`data` 必须是 null** —— 终止块带 payload 会被记 warning 并丢弃那个 data。
-4. 或者以错误结束: `{"stream_id":"s-1","code":-32603,"message":"boom","data":{}}`。
+3. Finish with `{"stream_id":"s-1","seq":1,"data":null,"done":true}`. **`data` must be null**: a terminal chunk carrying a payload is recorded as a warning and that data is dropped.
+4. Or end with an error: `{"stream_id":"s-1","code":-32603,"message":"boom","data":{}}`.
 
-关于你自己的 `seq`: 内核**不使用**它（调用方看到的是内核重编号的 seq）。写递增的整数仍然是对的 —— 它是你排查自己问题的依据。
+About your own `seq`: the kernel **does not use** it (callers see the kernel's renumbering). Writing an increasing integer is still right, because it is what you debug your own problems with.
 
-关于名字: 你的 `stream_id` 在**你自己的管道上**唯一即可，内核负责跨插件改名。你可以同时开多条流。
+About the name: your `stream_id` only has to be unique **on your own pipe**; the kernel handles renaming across plugins. You may have several streams open at once.
 
-### 7.3 内核替你做的事
+### 7.3 What the kernel does for you
 
-- 改名: 你的 `stream_id` → 调用方的 `f-N`。
-- 重编号: 调用方看到的 `seq` 从 0 连续递增。
-- 背压: 见下。
-- 空闲超时: 见下。
-- 取消转发、终止块唯一化、提供方崩溃时把 -32011 送成 `$/stream/error`。
+- Renaming: your `stream_id` becomes the caller's `f-N`.
+- Renumbering: the caller sees `seq` increasing from 0.
+- Backpressure: see below.
+- Idle timeout: see below.
+- Cancellation forwarding, single terminal chunk, and a -32011 delivered as `$/stream/error` when the provider crashes.
 
-### 7.4 背压（你需要知道，因为它会咬你）
+### 7.4 Backpressure (you need to know, because it bites)
 
-- 调用方的出站队列超过 `queue_high_water_bytes`（默认 2 MiB）时，块不再直投，而是暂存在内核里。
-- 降到 `queue_low_water_bytes`（默认 1 MiB）以下才放行。巡检间隔约 100 ms，所以这不是零延迟的。
-- 暂存有硬顶: `stream_buffer_chunks`（默认 4096 块）和 `stream_buffer_bytes`（默认 8 MiB）。**超了就终止这条流**，调用方收到 -32019 的 `$/stream/error`。
-- 调用方读得慢（队列塞满连暂存都放不下）同样是 -32019 终止。
-- 宿主（`"host"`）那条队列受完全一样的水位约束 —— 嵌入方读得慢也一样会被节流。
+- When a caller's outbound queue passes `queue_high_water_bytes` (default 2 MiB), chunks stop going straight out and are held inside the kernel instead.
+- They are released only once the queue drops below `queue_low_water_bytes` (default 1 MiB). The sweep runs about every 100 ms, so this is not zero-latency.
+- Holding has hard ceilings: `stream_buffer_chunks` (default 4096 chunks) and `stream_buffer_bytes` (default 8 MiB). **Past either, the stream is terminated** and the caller gets a -32019 `$/stream/error`.
+- A slow reader (a queue so full that even the holding area has no room) is also terminated with -32019.
+- The host's queue (`"host"`) is bound by exactly the same watermarks: an embedder that reads slowly is throttled the same way.
 
-推论: **你不能假设自己推多少对方就收多少。** 长时间快推要能接受被终止，或者自己实现分页/拉取式接口。
+The corollary: **you cannot assume the other side receives as much as you push.** A long fast producer must either accept termination or implement a paged or pull-style interface of its own.
 
-### 7.5 空闲超时
+### 7.5 Idle timeout
 
-一条流超过 `stream_idle_timeout_ms`（默认 30000，可按**提供方插件**覆盖）没有任何块，内核会终止它: 调用方收到 -32012（"stream went idle"），你会收到 `$/cancel`。
+A stream with no chunk for longer than `stream_idle_timeout_ms` (default 30000, overridable per **provider plugin**) is terminated: the caller gets -32012 ("stream went idle") and you get `$/cancel`.
 
-所以长任务要**心跳**: 定期发一块（哪怕是空 data），否则会被当成卡死。
+So a long task needs **heartbeats**: send a chunk on a schedule, even an empty one, or you are treated as stuck.
 
-### 7.6 取消
+### 7.6 Cancellation
 
-- 你取消自己发出的调用: `$/cancel{request_id: "r-1"}`（用你当初写的字符串 id），或 `$/cancel{stream_id: "f-3"}`。
-- 内核取消你: `$/cancel{request_id: <数字>}`（内核给提供方的调用号）。
-- **取消是协作式的。** 内核做的只有两件事: 停止转发、把 `$/cancel` 转给提供方。它无法强制提供方停工。收到 `$/cancel` 就尽早收尾并停止发块（对已死的流发的块会被丢弃并记 debug 日志）。
-- **取消之后没有终止帧** —— `done:true` 和 `$/stream/error` 都不会来。提出取消的那一方知道自己放弃了，不需要内核再通知一次。
-- 宿主也能取消它自己的流，同一条通知、同一套参数（见 14.2）。
+- You cancelling a call you made: `$/cancel{request_id: "r-1"}` (the string id you wrote), or `$/cancel{stream_id: "f-3"}`.
+- The kernel cancelling you: `$/cancel{request_id: <number>}` (the call number the kernel gave your provider).
+- **Cancellation is cooperative.** The kernel only does two things: stop forwarding and pass `$/cancel` to the provider. It cannot force the provider to stop. On `$/cancel`, wrap up as soon as you can and stop sending chunks (chunks sent on a dead stream are dropped and logged at debug level).
+- **There is no terminal frame after a cancellation**: neither `done:true` nor `$/stream/error` arrives. Whoever asked for the cancellation knows it gave up, and does not need the kernel to say so twice.
+- The host can cancel its own streams too, with the same notification and the same params (see 14.2).
 
-### 7.7 id 命名空间
+### 7.7 The id namespaces
 
-| 前缀 | 谁生成 | 用在哪 |
+| prefix | who makes it | used for |
 |---|---|---|
-| `f-N` | 内核 | 调用方的 stream_id |
-| `sub-N` | 内核 | 订阅 id |
-| `host-N` | 内核 | 宿主发起的调用（只在宿主侧可见） |
+| `f-N` | the kernel | a caller's stream_id |
+| `sub-N` | the kernel | a subscription id |
+| `host-N` | the kernel | a call the host made (visible on the host side only) |
 
-插件自己起的 stream_id 完全自由，只要求在自己的管道上唯一。不要刻意模仿上面的前缀。
+A plugin's own stream_id is entirely free; it only has to be unique on its own pipe. Do not imitate the prefixes above.
+
 ---
 
-## 8. 事件
+## 8. Events
 
-事件是**广播**: 你发的事件送给所有图案匹配的订阅者（包括宿主），你订阅的事件来自所有人。
+Events are a **broadcast**: what you publish goes to every subscriber whose pattern matches (the host included), and what you subscribe to may come from anyone.
 
-### 8.1 收事件
+### 8.1 Receiving an event
 
 ```json
 {"method":"$/event",
  "params":{"topic":"kernel.plugin.started","seq":12,"payload":{"plugin":"p","pid":4242}}}
 ```
 
-### 8.2 图案匹配
+### 8.2 Pattern matching
 
-图案按 `.` 分段，逐段比较:
+Patterns are split on `.` and compared segment by segment:
 
-- `*` 恰好匹配**一段**。
-- `**` 是预留写法，**在 v1 里不匹配任何东西**（别指望它做多段通配）。
-- 图案和主题的段数必须相等。
+- `*` matches exactly **one segment**.
+- `**` is reserved and **matches nothing in v1** (do not count on it for multi-segment wildcards).
+- A pattern and a topic must have the same number of segments.
 
-| 图案 | 匹配 | 不匹配 |
+| pattern | matches | does not match |
 |---|---|---|
-| `demo.*` | `demo.turn` | `demo.turn.started`（段数不等）、`loops.turn` |
+| `demo.*` | `demo.turn` | `demo.turn.started` (different segment count), `loops.turn` |
 | `demo.turn` | `demo.turn` | `demo.turn.started` |
 | `*.*` | `demo.turn` | `demo` |
 | `kernel.plugin.*` | `kernel.plugin.started` | `kernel.plugin.a.b` |
 
 ### 8.3 seq
 
-`seq` 是**总线级**单调递增计数，不是每个主题各自计数。它能帮你发现"我漏了什么"，但不能用来判断"某个主题连续不连续"。
+`seq` is a **bus-wide** increasing counter, not a per-topic one. It helps you notice "I missed something", but it cannot tell you whether one topic had a gap.
 
-### 8.4 投递预算与丢弃
+### 8.4 Delivery budget and drops
 
-每个订阅有一份预算，按"已投递未确认"的量和字节计:
+Every subscription has a budget, counted in delivered-but-unacknowledged items and bytes:
 
-| 项 | 默认 |
+| item | default |
 |---|---|
-| `event_queue_len` | 1024 条 |
+| `event_queue_len` | 1024 events |
 | `event_queue_bytes` | 4 MiB |
 
-超预算时:
+Past budget:
 
-1. **丢掉最新的一条**（不是最老的）。
-2. 给你发一条 `kernel.event.dropped`，`payload` 是 `{subscription_id, dropped_count}`，`seq` 固定为 0。
-3. 这条丢弃通知**不占预算**，而且是同一订阅**每秒最多一次** —— 它是你发现自己掉队的唯一方式。
-4. 你一旦消费（内核确认投递）就归还预算，所以卡住的订阅者会持续触发丢弃。
+1. **The newest event is dropped** (not the oldest).
+2. You get a `kernel.event.dropped` with `payload` `{subscription_id, dropped_count}` and `seq` fixed at 0.
+3. That drop notice **does not consume budget** and is sent at most once per second per subscription. It is the only way you find out you fell behind.
+4. Budget is returned as soon as you consume (the kernel confirms delivery), so a stuck subscriber keeps triggering drops.
 
-单帧大小按 `payload 字节数 + topic 长度 + 64` 估算。
+A frame's size is estimated as `payload bytes + topic length + 64`.
 
-**结论: 事件是"尽力而为"，不是可靠队列。** 掉队会被明确告知，但不会补发。要可靠传输就用能力调用。
+**Conclusion: events are best-effort, not a reliable queue.** Falling behind is reported explicitly but nothing is resent. Use capability calls when you need reliable delivery.
 
-### 8.5 内核自己发的事件
+One exception is `replay` in §14.2: when you have just subscribed, you can ask the kernel to send one `kernel.plugin.started` for each plugin **currently alive**. The startup-time events happened before you had a subscription, and without a replay you would never see them, leaving the host no way to learn where each plugin's entry point is.
 
-| topic | payload | 何时 |
+### 8.5 Events the kernel publishes itself
+
+| topic | payload | when |
 |---|---|---|
-| `kernel.plugin.started` | `plugin`, `pid` | 某插件 `start` 成功后 |
-| `kernel.plugin.stopped` | `plugin`, `reason`（`shutdown` 或 `crash`） | 进程结束 |
-| `kernel.plugin.degraded` | `plugin`, `code`, `signal`, `message` | 插件没被要求就退出了 |
-| `kernel.capabilities.changed` | `capabilities`（整张新表） | 热重载换了路由表 |
-| `kernel.config.reloaded` | `path` | 配置变更被接受 |
-| `kernel.event.dropped` | `subscription_id`, `dropped_count` | 你掉队了 |
+| `kernel.plugin.started` | `plugin`, `pid`, `trigger`, `cwd`, `command`, `args` | after a plugin's `start` succeeds |
+| `kernel.plugin.stopped` | `plugin`, `reason` (`shutdown` or `crash`), plus `trigger` when the kernel asked for the stop | the process ended |
+| `kernel.plugin.degraded` | `plugin`, `code`, `signal`, `message` | a plugin exited without being asked |
+| `kernel.capabilities.changed` | `capabilities` (the whole new table) | a hot reload swapped the routing table |
+| `kernel.config.reloaded` | `path` | a config change was accepted |
+| `kernel.event.dropped` | `subscription_id`, `dropped_count` | you fell behind |
 
-这些 topic 用 `kernel.` 前缀，插件不能发布它们。想收就先 `kernel.subscribe`，例如 `{"patterns":["kernel.plugin.*"]}`。
+These topics use the `kernel.` prefix and plugins may not publish them. To receive them, `kernel.subscribe` first, for example `{"patterns":["kernel.plugin.*"]}`.
 
-### 8.6 热重载与事件
+`trigger` says what caused this lifecycle change:
 
-配置文件的变更被接受时（哪一层都算，见 §12.4），内核会发 `kernel.capabilities.changed`（带整张新表）和 `kernel.config.reloaded`。重载过程中**内核自己不重启**；新增或改动的插件被拉起来、重新 `initialize` + `start`，被替换掉的插件在 drain 之后收到 `shutdown{reason:"reload"}`。重载失败（新配置坏了）会被整体回滚并继续用旧配置跑，你只会看到一条日志，不会有事件。
+| trigger | meaning |
+|---|---|
+| `boot` | brought up, or held back, by the kernel at startup |
+| `config` | the config file changed and the reloader brought it up, stopped it or left it waiting |
+| `source` | the host saw source change and restarted this plugin by name (§8.6) |
+| `manual` | the host restarted it by hand |
+
+When a host `subscribe` carries `replay: true`, the kernel sends one `kernel.plugin.started` for each plugin alive right now, with exactly the fields a live event has and `trigger` set to the value from when they came up, plus one `kernel.plugin.blocked` for each plugin waiting right now. These are real events: a plugin subscribed to a matching pattern receives them as well.
+
+`kernel.plugin.started` also carries `cwd`, `command` and `args`, the values after loader resolution. They are how a host knows where a plugin's entry file lives, for example to map a changed file back to the plugin that should restart. A crash (`reason: "crash"`) has no `trigger`; only a stop the kernel itself asked for has one.
+
+### 8.6 Hot reload and events
+
+When a config file change is accepted (at any layer, see §12.4), the kernel emits `kernel.capabilities.changed` (with the whole new table) and `kernel.config.reloaded`. **The kernel itself does not restart** during a reload: added or changed plugins are brought up and go through `initialize` + `start` again, while replaced plugins are drained and then get `shutdown{reason:"reload"}`. A failed reload (the new config is broken) is rolled back as a whole and the old config keeps running; you only see a log line, no event.
+
+A reload can also leave a plugin without something it requires: if the provider is gone (disabled, or no longer declaring the slot), the consumer is stopped (its `kernel.plugin.stopped` carries `trigger: config`) and enters the waiting state of §6, and the reload that brings the provider back starts the consumer again. A `restart` whose plugin lands in the waiting state still answers `{}`; `kernel.plugin.blocked` is what says what it is waiting for. A restart **stops first, then starts**: the old instance goes down cleanly through `shutdown{reason:"reload"}` and is waited for. Past that plugin's `shutdown_grace_ms` it is killed, and if it still refuses to leave the restart is rejected with -32011. Then the same bring-up pipeline a reload uses runs: spawn, `initialize`, validate the whole graph, swap the table, `start`, and finally another `kernel.capabilities.changed`. Stopping first is because things like ports exist once: the web plugin binds 8341 by default, and starting the new instance first would only hit EADDRINUSE.
+
+After a successful restart the new instance has a new pid, and the `trigger` on both `kernel.plugin.started` and `kernel.plugin.stopped` records who asked. The plugin itself still sees `reload`. If the new instance cannot come up, that plugin stays absent, capability calls get -32011 (`data.plugin` names it), the log carries one `restart rejected: ...` line, and another `restart` retries. A restart touches only the plugin named, so other plugins never even see the routing table move.
 
 ---
 
-## 9. 终端 io 原语
+---
 
-先说清楚边界，免得你以为内核在偷偷做别的事。
+## 9. The terminal io primitives
 
-内核的口号是"只负责加载、卸载、依赖"。但**把宿主自己的 stdin/stdout 在多个插件之间多路复用，本质上是传输层的工作**，所以内核把它算进了自己的职责。这一块确实超出了那句口号，这里如实写明。即便如此，内核依然不知道什么叫 UI —— 它只是把字节按所有权转发给某一个插件。
+Start with the boundary, so you do not think the kernel is quietly doing something else.
+
+The kernel's slogan is "load, unload, dependencies, and nothing more". But **multiplexing the host's own stdin/stdout between plugins is transport work**, so the kernel counts it as its own job. This part genuinely goes past that slogan, and it is written down here honestly. Even so, the kernel still has no idea what a UI is: it only forwards bytes to one plugin at a time, by ownership.
 
 ### 9.1 stdin
 
-- **同一时刻只有一个所有者。** `kernel.attach{stream:"stdin"}` 是抢占式的: 原所有者立刻收到 `$/io/detached{stream:"stdin", reason:"taken_over"}`。抢占在一把锁内完成，不会出现两个插件都以为自己拥有 stdin 的窗口。
-- **内核只有在有人 attach 之后才开始读自己的 stdin。** 首次 attach 之前一个字节都不读，所以 `echo hi | ...` 的输入会待在操作系统缓冲区里，不会丢。
-- 数据以字符串送达:
+- **One owner at a time.** `kernel.attach{stream:"stdin"}` is preemptive: the previous owner immediately gets `$/io/detached{stream:"stdin", reason:"taken_over"}`. The takeover happens inside one lock, so there is no window in which two plugins both believe they own stdin.
+- **The kernel only starts reading its own stdin once someone attached.** Not one byte is read before the first attach, so input from `echo hi | ...` waits in the operating system's buffer instead of being lost.
+- Data arrives as a string:
 
 ```json
 {"method":"$/io/data","params":{"stream":"stdin","data":"hello\n","eof":false}}
 ```
 
-- `data` 是**字符串**，不是 base64。非 UTF-8 的字节会被**有损解码**（变成 U+FFFD）—— 想传二进制就别用这个通道，用能力调用传 base64。
-- **分块按读取大小切，不按行切**（`io_line_bytes`，默认 8 KiB）。字段名叫 line，别被误导: 一个 `$/io/data` 不等于一行。要按行处理就自己缓冲。
-- 宿主 stdin 结束时会先收到一条 `{"data":"","eof":true}`，然后内核开始统一关机（reason = `kernel_exit`）。这是"上游管道关了"的规范路径。
-- 读操作在 detach 时会中断；重新 attach 之后，最多可能丢掉一个已读出但还没投递的块。
-- `mode`（默认 `"line"`）在 v1 里**只被记录，不影响任何行为**。别依赖它。
+- `data` is a **string**, not base64. Bytes that are not valid UTF-8 are **lossily decoded** (into U+FFFD), so use capability calls with base64 if you need binary.
+- **Chunking follows read size, not lines** (`io_line_bytes`, default 8 KiB). The field name says line, but do not be misled: one `$/io/data` is not one line. Buffer it yourself if you want lines.
+- When the host's stdin ends you first get `{"data":"","eof":true}`, and then the kernel begins its unified shutdown (reason = `kernel_exit`). That is the canonical "the upstream pipe closed" path.
+- A read is interrupted by detach; after re-attaching you may lose at most one chunk that was read but not yet delivered.
+- `mode` (default `"line"`) is **recorded only and changes no behaviour** in v1. Do not depend on it.
 
 ### 9.2 stdout
 
-- `kernel.attach{stream:"stdout"}` 声明所有权。stdout 的 `mode` 在 v1 里没有作用。
-- 写:
+- `kernel.attach{stream:"stdout"}` claims ownership. The stdout `mode` has no effect in v1.
+- Writing:
 
 ```json
 {"method":"kernel.write","params":{"stream":"stdout","data":"\u001b[2J"}}
 → {}
 ```
 
-  - 只允许 `stream: "stdout"`（其他值 -32602）。
-  - 单条 `data` 超过 `event_payload_bytes`（默认 256 KiB）→ -32020。
-  - 内核 stdout 队列积压超过 `io_write_queue_bytes`（默认 4 MiB）→ -32019。别把 stdout 当无底洞。
-  - `data` 是字符串; 写的是原始字节（UTF-8 编码后）。终端转义序列直接写即可。
-- `kernel.detach{stream:"stdout"}` 释放。
-- **detach 明确不是关机信号。** 释放 stdout 不会触发下线。
----
-
-## 10. 错误码表
-
-标准 JSON-RPC 五个原样复用，其余是 eggshellmod 自己的块。
-
-| code | 名字 | 含义 |
-|---|---|---|
-| -32700 | `parse_error` | 帧体不是合法 JSON |
-| -32600 | `invalid_request` | 是 JSON 但不是对象; 或既无 `method` 也无 `id` |
-| -32601 | `method_not_found` | 内核不认识这个方法 |
-| -32602 | `invalid_params` | 参数缺失/不合法 |
-| -32603 | `internal_error` | 内核内部错误（例如响应没交到） |
-| -32010 | `unknown_capability` | 没有任何插件提供这个能力 id |
-| -32011 | `provider_unavailable` | 提供方已退出/不可用 |
-| -32012 | `request_timeout` | 调用超时，或流空闲超时 |
-| -32013 | `cancelled` | 已取消 |
-| -32014 | `not_started` | 提供方还活着但没 `start` |
-| -32015 | `protocol_version_mismatch` | `initialize` 的 `protocol` 不是 1 |
-| -32016 | `frame_too_large` | 帧超过 `max_frame_bytes` |
-| -32017 | `unknown_stream` | 未知的流 id |
-| -32018 | `invalid_config` | 配置/启动问题（例如 spawn 失败） |
-| -32019 | `overloaded` | 并发、队列或流缓冲到顶 |
-| -32020 | `payload_too_large` | payload 超过上限（事件或 `kernel.write`） |
-| -32021 | `unknown_subscription` | 订阅 id 不认识 |
-
--32602 具体会在这些地方出现: `kernel.invoke` 缺字符串 `meta.request_id`、`initialize` 回复里缺 `provides`/`requires`、版本字符串不是合法 semver、订阅 `patterns` 为空、io `stream` 不是 `stdin`/`stdout`、`kernel.write` 的 `stream` 不是 `stdout`、`kernel.unsubscribe` 的 id 写法不合法、`kernel.publish` 用了 `kernel.` 前缀、宿主 `shutdown` 的 `reason` 不在允许的两个值里。
-
-三条注意:
-
-- **-32016 永远不是一条响应。** 帧太大时管道已经不可信，内核记录日志/事件/`--check` 结果，并杀掉插件。
-- `-32013`（cancelled）和 `-32017`（unknown_stream）目前在代码里是**保留值**: 表里有名字，正常路径上不会产生。写成插件时按"可能出现"处理即可，别依赖它出现。
-- 内核 `--check` 模式下，`-32011` 有特殊含义: 插件在 `initialize` 之后自己退出了。正常运行时 `-32011` 是"提供方已经没了"。
+  - Only `stream: "stdout"` is allowed (anything else is -32602).
+  - A single `data` past `event_payload_bytes` (default 256 KiB) is -32020.
+  - A backlog in the kernel's stdout queue past `io_write_queue_bytes` (default 4 MiB) is -32019. Do not treat stdout as bottomless.
+  - `data` is a string, and the raw bytes written are its UTF-8 encoding. Terminal escape sequences can be written directly.
+- `kernel.detach{stream:"stdout"}` releases it.
+- **Detach is explicitly not a shutdown signal.** Releasing stdout does not trigger going down.
 
 ---
 
-## 11. 限制与超时
+## 10. Error code table
 
-所有限制都在配置文件的 `[kernel]` 表里，字段名相同。每个都有默认值，只写你要改的。
+The five standard JSON-RPC codes are reused verbatim; the rest are eggshellmod's own block.
 
-| 字段 | 默认 | 作用 |
+| code | name | meaning |
 |---|---|---|
-| `max_frame_bytes` | 64 MiB | 单帧体上限，超了 -32016 |
-| `initialize_timeout_ms` | 5000 | `initialize` 应答上限 |
-| `start_timeout_ms` | 10000 | `start` 应答上限 |
-| `shutdown_grace_ms` | 5000 | `shutdown` 之后等你退出的时间 |
-| `request_timeout_ms` | 30000 | 一次普通能力调用的超时 |
-| `stream_idle_timeout_ms` | 30000 | 流多久没块算卡死 |
-| `event_payload_bytes` | 256 KiB | `kernel.publish` payload 上限（也是 `kernel.write` 单条上限） |
-| `event_queue_len` | 1024 | 每个订阅的条数预算 |
-| `event_queue_bytes` | 4 MiB | 每个订阅的字节预算 |
-| `outbound_queue_bytes` | 4 MiB | 发往单个插件的出站队列上限 |
-| `io_write_queue_bytes` | 4 MiB | 内核 stdout 队列上限 |
-| `queue_high_water_bytes` | 2 MiB | 上层水位，超过就暂存流块 |
-| `queue_low_water_bytes` | 1 MiB | 下层水位，降到这里才放行 |
-| `stream_buffer_chunks` | 4096 | 单条流的暂存块数上限 |
-| `stream_buffer_bytes` | 8 MiB | 单条流的暂存字节上限 |
-| `max_inflight` | 64 | 每个插件的在飞调用上限 |
-| `max_inflight_total` | 1024 | 全局在飞调用上限 |
-| `drain_ms` | 5000 | 关机时等在飞调用的预算 |
-| `io_eof_idle_ms` | 500 | 关机时"安静多久算干完了" |
-| `max_plugins` | 64 | 插件数量上限 |
-| `log_line_bytes` | 8 KiB | 日志行截断 / 插件 stderr 行上限 |
-| `io_line_bytes` | 8 KiB | 每次读 stdin 的块大小 |
+| -32700 | `parse_error` | the frame body is not valid JSON |
+| -32600 | `invalid_request` | valid JSON but not an object, or neither `method` nor `id` |
+| -32601 | `method_not_found` | the kernel does not know this method |
+| -32602 | `invalid_params` | params missing or invalid |
+| -32603 | `internal_error` | an error inside the kernel (a response that was not delivered, for instance) |
+| -32010 | `unknown_capability` | no plugin provides this capability id |
+| -32011 | `provider_unavailable` | the provider has exited or is unavailable |
+| -32012 | `request_timeout` | the call timed out, or a stream went idle |
+| -32013 | `cancelled` | cancelled |
+| -32014 | `not_started` | the provider is alive but has not `start`ed |
+| -32015 | `protocol_version_mismatch` | the `protocol` in `initialize` is not 1 |
+| -32016 | `frame_too_large` | the frame is past `max_frame_bytes` |
+| -32017 | `unknown_stream` | unknown stream id |
+| -32018 | `invalid_config` | a config or startup problem (a failed spawn, for instance) |
+| -32019 | `overloaded` | concurrency, a queue, or a stream buffer is full |
+| -32020 | `payload_too_large` | the payload is past its ceiling (an event or `kernel.write`) |
+| -32021 | `unknown_subscription` | unknown subscription id |
 
-每个插件可以在 `[plugins.<id>]` 里覆盖这几项:
+-32602 shows up in these places: a `kernel.invoke` missing the string `meta.request_id`, an `initialize` reply missing `provides`/`requires`, a version string that is not valid semver, an empty subscription `patterns`, an io `stream` that is neither `stdin` nor `stdout`, a `kernel.write` whose `stream` is not `stdout`, an ill-formed `kernel.unsubscribe` id, a `kernel.publish` using the `kernel.` prefix, and a host `shutdown` whose `reason` is not one of the two allowed values.
 
-| 字段 | 覆盖 |
+Three notes:
+
+- **-32016 is never a response.** Once a frame is too large the pipe is no longer trustworthy, so the kernel logs it (as a log line, an event, or `--check` output) and kills the plugin.
+- `-32013` (cancelled) and `-32017` (unknown_stream) are currently **reserved values** in the code: they have names in the table but no normal path produces them. Write plugins as if they might appear, but do not rely on seeing them.
+- Under the kernel's `--check` mode `-32011` means something special: the plugin exited on its own after `initialize`. In normal operation `-32011` means "the provider is gone".
+
+---
+
+## 11. Limits and timeouts
+
+Every limit lives in the config file's `[kernel]` table under the same field name. All have defaults, so write only what you change.
+
+| field | default | what it does |
+|---|---|---|
+| `max_frame_bytes` | 64 MiB | frame body ceiling, past it -32016 |
+| `initialize_timeout_ms` | 5000 | how long the kernel waits for the `initialize` reply |
+| `start_timeout_ms` | 10000 | how long it waits for the `start` reply |
+| `shutdown_grace_ms` | 5000 | how long it waits for you to exit after `shutdown` |
+| `request_timeout_ms` | 30000 | timeout of one ordinary capability call |
+| `stream_idle_timeout_ms` | 30000 | how long a stream may go without a chunk |
+| `event_payload_bytes` | 256 KiB | `kernel.publish` payload ceiling (also the single-write ceiling for `kernel.write`) |
+| `event_queue_len` | 1024 | item budget per subscription |
+| `event_queue_bytes` | 4 MiB | byte budget per subscription |
+| `outbound_queue_bytes` | 4 MiB | outbound queue ceiling towards one plugin |
+| `io_write_queue_bytes` | 4 MiB | ceiling of the kernel's stdout queue |
+| `queue_high_water_bytes` | 2 MiB | upper watermark; past it stream chunks are held |
+| `queue_low_water_bytes` | 1 MiB | lower watermark; chunks are released once it is reached |
+| `stream_buffer_chunks` | 4096 | held-chunk ceiling for one stream |
+| `stream_buffer_bytes` | 8 MiB | held-byte ceiling for one stream |
+| `max_inflight` | 64 | in-flight calls per plugin |
+| `max_inflight_total` | 1024 | in-flight calls overall |
+| `drain_ms` | 5000 | budget for waiting on in-flight calls at shutdown |
+| `io_eof_idle_ms` | 500 | how quiet things must be at shutdown to count as done |
+| `max_plugins` | 64 | plugin count ceiling |
+| `log_line_bytes` | 8 KiB | log line truncation, and the ceiling for one plugin stderr line |
+| `io_line_bytes` | 8 KiB | read size per stdin read |
+
+A plugin may override these under `[plugins.<id>]`:
+
+| field | overrides |
 |---|---|
-| `initialize_timeout_ms` | `initialize` 超时 |
-| `start_timeout_ms` | `start` 超时 |
-| `shutdown_grace_ms` | 退出宽限 |
-| `request_timeout_ms` | 别人调你这个插件时的默认超时 |
-| `stream_idle_timeout_ms` | 你提供的流的空闲超时 |
-| `max_inflight` | 别人能同时调你多少个 |
+| `initialize_timeout_ms` | the `initialize` timeout |
+| `start_timeout_ms` | the `start` timeout |
+| `shutdown_grace_ms` | the exit grace period |
+| `request_timeout_ms` | the default timeout when someone calls this plugin |
+| `stream_idle_timeout_ms` | the idle timeout of the streams you provide |
+| `max_inflight` | how many calls others may have in flight against you |
+
 ---
 
-## 12. 清单与最小插件
+---
 
-### 12.1 内核怎么把你拉起来
+## 12. Checklist and a minimal plugin
 
-配置片段:
+### 12.1 How the kernel brings you up
+
+A config fragment:
 
 ```toml
 [plugins.demo]
-command = "node"                    # 裸名字 → 交给操作系统在 PATH 上找
+command = "node"                    # a bare name goes to the OS to be found on PATH
 args = ["plugins/minimal-plugin.js"]
-# cwd 缺省是入口配置文件所在目录（见 §12.4）
-# env = { API_KEY = "${TOKEN}" }    # ${VAR} 会展开；变量没设是硬错误
-# clear_env = true                  # 清空继承来的环境变量
-# request_timeout_ms = 1000         # 别人调我时的默认超时
+# name = "@scope/plugin"          # the other form: run a package instead of a program
+# cwd defaults to the directory of the entry config file (see §12.4)
+# env = { API_KEY = "${TOKEN}" }    # ${VAR} expands; an unset variable is a hard error
+# clear_env = true                  # drop the inherited environment
+# disabled = true                   # the row stays but nothing starts; an upper layer writing disabled = false enables it
+# request_timeout_ms = 1000         # the default timeout when someone calls me
 
-[plugins.demo.config]               # 原样出现在 initialize 的 params.config 里
+[plugins.demo.config]               # appears verbatim as initialize's params.config
 greeting = "hi"
 
-# [capability]                     # 只在两个插件抢同一个能力时才需要写
-# "demo.text" = "demo"             # 那一条 pin：这个能力由谁提供（见 §6）
+# [capability]                     # only needed when two plugins fight over one capability
+# "demo.text" = "demo"             # that one pin: who provides this capability (see §6)
 ```
 
-- `command` 里**带路径分隔符**时按入口配置文件所在目录解析；**裸名字**留给 PATH（所以 `node` / `python` / `deno` 直接写）。
-- `args` 也会做 `${VAR}` 展开，但不会被当成路径解析。
-- `${VAR}` 未定义是**硬错误**（宁可拒绝启动，也不要静默变成空串）; `$$` 表示一个字面 `$`; 展开**不递归**。
-- 插件 id 不能是 `host`（保留给宿主）。
+- A `command` **containing a path separator** is resolved against the entry config file's directory; a **bare name** goes to PATH (so `node`, `python` and `deno` can be written directly).
+- `args` also expands `${VAR}` but is not treated as a path.
+- A row names either a `command` or a `name`, never both, and one of the two is required.
+- `name` is resolved the way Node resolves an import from the config file: the nearest `node_modules/<name>/package.json` at or above the entry config file's directory. The entry is that manifest's own `exports["."]` (`import`, then `default`, then the export itself when it is a string) or its `main`, defaulting to `index.js`, and the file is run with `node`. The row's `args` are appended after the entry. The resolved file is the real one on disk, so a link in a profile directory still runs the package it points at.
+- An undefined `${VAR}` is a **hard error** (refusing to start beats silently becoming an empty string); `$$` is a literal `$`; expansion is **not recursive**.
+- A plugin id may not be `host` (reserved for the host).
+- A row with `disabled = true` still takes part in layer merging, but the kernel does not start it and it is not in the capability table. An upper layer overriding it to `false` enables it, and the reloader brings it up on its own once it sees the file change (no kernel restart needed).
 
-### 12.2 一个能跑的最小插件（TypeScript / Node）
+### 12.2 A minimal plugin that runs (TypeScript / Node)
 
 ```ts
 #!/usr/bin/env node
-// 一个用 Node 写的 eggshell 插件：会说协议，就够了。
+// An eggshell plugin written with Node: speaking the protocol is all it takes.
 import { writeSync } from "node:fs";
 
 const provides = [{ capability: "demo.text", version: "1.0.0" }];
@@ -807,13 +845,13 @@ process.stdin.on("data", (incoming: Buffer) => {
   }
 });
 
-// 内核关了 stdin（或要求 shutdown 后），正常退出。
+// The kernel closed stdin (or asked for shutdown): leave cleanly.
 process.stdin.on("end", () => process.exit(0));
 
 function handle(message: any): void {
   const { id, method, params } = message;
-  if (method === undefined) return;                 // 响应：本示例不主动调别人
-  if (id === undefined || id === null) return;      // 通知：不需要回复
+  if (method === undefined) return;                 // a response; this sample calls nobody
+  if (id === undefined || id === null) return;      // a notification; no reply wanted
 
   switch (method) {
     case "initialize":
@@ -822,7 +860,7 @@ function handle(message: any): void {
       return;
 
     case "start":
-      // params.capabilities 是整张路由表快照，按需缓存。
+      // params.capabilities is the whole routing table snapshot; cache it if you need it.
       send({ jsonrpc: "2.0", id, result: {} });
       return;
 
@@ -831,18 +869,18 @@ function handle(message: any): void {
         send({ jsonrpc: "2.0", id, result: { echo: params?.params ?? null } });
         return;
       }
-      // 流式：必须先回 stream_id，再发块。
+      // Streaming: the stream_id reply must come first, then the chunks.
       const streamId = `s-${id}`;
       send({ jsonrpc: "2.0", id, result: { stream_id: streamId } });
       for (let n = 0; n < 3; n += 1) {
         chunk(streamId, n, { delta: `chunk ${n}` }, false);
       }
-      chunk(streamId, 3, null, true);                // 终止块：data 必须为 null
+      chunk(streamId, 3, null, true);                // terminal chunk: data must be null
       return;
     }
 
     case "shutdown":
-      // 所有 reason 一视同仁：收尾、回包、退出。
+      // Every reason is treated the same: wrap up, reply, exit.
       send({ jsonrpc: "2.0", id, result: {} });
       process.exit(0);
 
@@ -852,12 +890,12 @@ function handle(message: any): void {
   }
 }
 
-// 想说话就主动发，例如：
+// To speak up on your own, just send, for example:
 // send({ jsonrpc: "2.0", method: "kernel.log",
 //        params: { level: "info", message: "ready", fields: {} } });
 ```
 
-跑它:
+Run it:
 
 ```toml
 [plugins.demo]
@@ -865,89 +903,94 @@ command = "node"
 args = ["minimal-plugin.mjs"]
 ```
 
-内核测试用的替身插件（`crates/eggshell-kernel/src/bin/eggshell-fixture.rs`，Rust）就是这个形状的另一种语言的实现，遇到不确定的地方可以对着它读。
+The stand-in plugin the kernel tests use (`crates/kernel/src/bin/eggshell-fixture.rs`, Rust) has this shape in another language; read it whenever something is unclear.
 
-### 12.3 自查清单
+### 12.3 A self-check list
 
-上线之前对着这几条过一遍:
+Go through this before shipping:
 
-- stdout 上没有任何非帧字节（包括依赖库的 print、进度条、banner）。
-- 每个请求都回了同一个 `id`（数字原样带回）。
-- `initialize` 回了 `protocol: 1` 和两个数组。
-- 流式回复里 `{stream_id}` 先于第一块。
-- 终止块 `done:true` 且 `data: null`。
-- 长任务有心跳块，不至于撞上 30 秒空闲超时。
-- `shutdown` 的四种 reason 行为一致，且真能退出去。
-- 日志走 `kernel.log` 或 stderr，不走 stdout。
+- No non-frame bytes on stdout (including a dependency's print, a progress bar, a banner).
+- Every request was answered with the same `id` (numbers echoed back unchanged).
+- `initialize` replied with `protocol: 1` and both arrays.
+- In a streaming reply, `{stream_id}` goes out before the first chunk.
+- The terminal chunk has `done:true` and `data: null`.
+- Long tasks send heartbeat chunks, so they do not hit the 30 second idle timeout.
+- All four `shutdown` reasons behave the same, and you really do exit.
+- Logs go through `kernel.log` or stderr, never stdout.
 
-### 12.4 配置文件可以分层（`extends`）
+### 12.4 Config files can be layered (`extends`)
 
-一个配置文件可以用 `extends` 列出它叠在哪些文件之上:
+A config file can list, with `extends`, the files it layers on top of:
 
 ```toml
-extends = ["eggshell.base.toml", "team.toml"]   # 先加载，按这个顺序
+extends = ["eggshell.base.toml", "team.toml"]   # loaded first, in this order
 ```
 
-- **列出的文件必须都在**。缺一个就启动失败并说出读不到哪个文件 —— 拼错文件名立刻可见，不会退化成"少了一层但看起来正常"。
-- 相对路径按**写它的那个文件**所在目录解析；绝对路径照写。
-- 后加载的层赢。同一个键谁后写谁算；**表逐键合并**（`[plugins.api.config]` 只覆盖它提到的那些键，其余的从下面那层活下来），**数组和标量整体替换**。所以一层可以只有一个键。
-- 相对 `command` / `cwd` 按**你启动时给的那个文件**（入口层）所在目录解析，不是按声明它的那一层。层放在别的目录时，用绝对路径说清楚。
-- 一个文件被走到两次（菱形依赖，或者绕回来）只算一次，位置取它第一次出现的地方。层栈总是有限，顺序稳定。
-- `--check` 会打印这次到底由哪几个文件组成，基础层在前、入口在后:
+- **Every listed file must exist.** A missing one fails startup and names the file that could not be read, so a typo in a filename is visible immediately instead of degrading into "one layer short but looking fine".
+- Relative paths are resolved against the directory of **the file that writes them**; absolute paths are used as written.
+- Later layers win. Within a key the last writer counts; **tables merge key by key** (`[plugins.api.config]` overrides only the keys it mentions, the rest survive from the layer below) while **arrays and scalars are replaced whole**. So a layer may hold a single key.
+- A relative `command` / `cwd` is resolved against the directory of **the file you passed at startup** (the entry layer), not the layer that declares it. When layers live in other directories, say so with an absolute path.
+- A file reached twice (a diamond, or a loop back) counts once, at the position where it first appears. The layer stack is always finite and the order stable.
+- `--check` prints which files this run is made of, base layers first and the entry last:
 
   ```
   config: eggshell.toml + eggshell.local.toml
   ```
 
-- 热重载盯的是**整摞层**: 改入口 `extends` 的某个文件，和改入口本身一样会触发重载。
-- `extends` 属于文件机制，不是插件配置: 它不会出现在任何插件的 `config` 里，而从一段字符串加载（没有文件可解析）时写 `extends` 是硬错误。插件看到的永远是合并、解析完的结果。
+- Hot reload watches **the whole stack**: editing a file named by the entry's `extends` triggers a reload exactly like editing the entry itself.
+- `extends` is a file mechanism, not plugin config: it never appears in any plugin's `config`, and writing `extends` when loading from a string (with no file to resolve against) is a hard error. What a plugin sees is always the merged, resolved result.
 
 ---
 
-## 13. 版本与兼容
+## 13. Version and compatibility
 
-- 当前 `PROTOCOL_VERSION = 1`。
-- 版本通过 `initialize` 的 `params.protocol` / `result.protocol` 协商; 任一侧不匹配就是 -32015，启动失败并明确报告双方版本。
-- 任何不兼容的线上改动都会递增它。**新增可选字段不算不兼容**（内核忽略不认识的字段），删除或改变已有字段的语义算。
-- `kernel_version` 只是诊断信息，不要拿它做特性判断 —— 要判断就判断 `protocol`。---
+- `PROTOCOL_VERSION` is currently 1.
+- The version is negotiated through `initialize`'s `params.protocol` / `result.protocol`; a mismatch on either side is -32015, which fails startup and reports both versions explicitly.
+- Any incompatible wire change bumps it. **Adding an optional field is not incompatible** (the kernel ignores fields it does not know), while removing a field or changing its semantics is.
+- `kernel_version` is diagnostic only; do not gate features on it. Gate on `protocol`.
 
-## 14. 宿主侧：内核当子进程
+---
 
-前面 13 节是"你写插件"的视角。这一节是另一头: **宿主**（比如用 TypeScript 写的 MaoTa）并不链接内核，而是把内核当子进程拉起来，在它的 fd 0 / fd 1 上讲同一套帧。
+---
 
-内核往上也只是一段"插件式"的程序: 宿主拉起它，它拉起插件。往下那一层（插件协议）完全不受影响。
+## 14. The host side: the kernel as a child process
 
-### 14.1 怎么起
+The previous 13 sections take the "you write a plugin" point of view. This one is the other end: a **host** (MaoTa, written in TypeScript, for instance) does not link the kernel but spawns it as a child process and speaks the same framing on its fd 0 / fd 1.
+
+Upward the kernel is just another plugin-shaped program: the host starts it and it starts the plugins. The layer below (the plugin protocol) is completely unaffected.
+
+### 14.1 How to start it
 
 ```
 eggshell <config.toml> [--check] [--json]
 ```
 
-这个可执行文件只在 `--features host` 构建时产出。默认构建不产出任何可执行文件（测试替身除外，见 12.2）。
+This executable is only produced by a `--features host` build. A default build produces no executables at all (apart from the test stand-in, see 12.2).
 
-`--check` 是配置体检: 拉起每个插件、`initialize` 一遍、校验能力图和版本范围、算出启动顺序，然后打印报告退出（0 = 通过，1 = 有 error）。它**从不发 `start`**、不碰 io、不发任何生命周期事件，所以不联网、没有副作用 —— 改完配置先跑这个，比开一次真对话快得多。报告写 stdout（体检模式下那个 fd 不是协议管道），字段和启动失败时 stderr 上那份一致；`--json` 把同一份报告打成一行 JSON 而不是文本。
+`--check` is a config check: it starts every plugin, runs `initialize` once, validates the capability graph and version ranges, computes the startup order, prints a report and exits (0 = pass, 1 = at least one error). A `disabled` row and a plugin left waiting are warnings, so a config that only has those still exits 0: the report carries them as `disabled` (plugin ids) and `blocked` (`{plugin id: [capability id]}`), and the text form prints one `disabled: a, b` line and one `waiting: a needs c` line per waiting plugin. It **never sends `start`**, never touches io and emits no lifecycle events, so it needs no network and has no side effects. Run it after editing a config; it is much faster than a real conversation. The report goes to stdout (under check mode that fd is not a protocol pipe) with the same fields as the one written to stderr on a failed startup, and `--json` prints the same report as one line of JSON instead of text.
 
 ```
-宿主 → 内核 fd 0    宿主发的帧（请求）
-宿主 ← 内核 fd 1    内核发的帧（回复 + 通知）
-        内核 fd 2    日志，一行一个 JSON 对象
+host -> kernel fd 0    frames the host sends (requests)
+host <- kernel fd 1    frames the kernel sends (replies + notifications)
+        kernel fd 2    logs, one JSON object per line
 ```
 
-分帧与第 1 节一字不差（`Content-Length`、8 KiB 头部上限、UTF-8 JSON 体）。插件看不出任何区别: `initialize` / `start` / `invoke` / `shutdown` 都没变。
+Framing is exactly section 1 (`Content-Length`, 8 KiB header ceiling, UTF-8 JSON body). Plugins see no difference at all: `initialize` / `start` / `invoke` / `shutdown` are unchanged.
 
-### 14.2 宿主能发的方法
+### 14.2 Methods a host may send
 
-就这五个，别的回 -32601:
+Exactly these six, anything else gets -32601:
 
 | method | params | result |
 |---|---|---|
-| `invoke` | `capability`、`method`、`params`，可选 `meta.stream` | 提供方的业务结果；流式为 `{stream_id}` |
-| `capabilities` | 无 | `{能力 id: {plugin, version}}` |
-| `subscribe` | `patterns`（字符串数组） | `{subscription_id}` |
+| `invoke` | `capability`, `method`, `params`, optional `meta.stream` | the provider's business result; `{stream_id}` when streaming |
+| `capabilities` | none | `{capability id: {plugin, version}}` |
+| `subscribe` | `patterns` (array of strings), optional `replay` (boolean, default false) | `{subscription_id}` |
 | `unsubscribe` | `subscription_id` | `{}` |
-| `shutdown` | 可选 `reason` | `{}`，**回完这一帧**才开始下线 |
+| `shutdown` | optional `reason` | `{}`, and going down starts **after this frame is sent** |
+| `restart` | `plugin`, optional `reason` (`source` or `manual`, default `manual`) | `{}`; -32011 (`data.plugin`) when the new instance cannot come up, -32602 for an unknown plugin or reason |
 
-一问一答:
+One question, one answer:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"invoke",
@@ -955,57 +998,59 @@ eggshell <config.toml> [--check] [--json]
 {"jsonrpc":"2.0","id":1,"result":{"got":{"hi":1}}}
 ```
 
-流式是同一个方法加 `"meta":{"stream":true}`: 回复是 `{"stream_id":"f-3"}`，块以 `$/stream/chunk` 通知送达，`seq` 照样由内核重编号（第 7 节）。事件就是第 8 节那套，只是订阅方是宿主。
+Streaming is the same method plus `"meta":{"stream":true}`: the reply is `{"stream_id":"f-3"}`, chunks arrive as `$/stream/chunk` notifications and `seq` is still renumbered by the kernel (section 7). Events are the section 8 machinery with the host as the subscriber.
 
-宿主 `meta` 里**只有 `stream` 被读**。`timeout_ms` 是插件反向调用内核时的字段，宿主这边没有透传 —— 宿主想精确超时得自己计时。
+Only `stream` is read out of the host's `meta`. `timeout_ms` is a field for a plugin calling back into the kernel and is not passed through on the host side, so a host that wants a precise timeout has to time it itself.
 
-关机可以带 `reason`:
+Shutdown may carry a `reason`:
 
 ```json
 {"jsonrpc":"2.0","id":9,"method":"shutdown","params":{"reason":"kernel_exit"}}
 ```
 
-- 只有两个是宿主能诚实给出的: `ui_quit`（不写 `reason` 时的缺省值）和 `kernel_exit`。写 `reload` / `check` 或别的字符串回 -32602，内核继续活着。
-- 插件看到的始终是 3.4 那张表里的四个值之一。
+- Only two are ones a host can honestly give: `ui_quit` (the default when `reason` is omitted) and `kernel_exit`. `reload` / `check` or any other string gets -32602 and the kernel keeps running.
+- What a plugin sees is always one of the four values in the table in 3.4.
 
-放弃一条流就发一条**通知**，方法和参数与插件那侧完全一样（7.6）:
+`restart` is for development: the reason it stops with is still `reload`, and `reason` only decides the event's `trigger` (`source` = a file changed, `manual` = a person pressed it). The restart semantics are in §8.6.
+
+Giving up a stream means sending one **notification**, with the same method and params as the plugin side (7.6):
 
 ```json
 {"jsonrpc":"2.0","method":"$/cancel","params":{"stream_id":"f-3"}}
 ```
 
-- **取消是静默的**: 内核停止转发、把 `$/cancel` 转给提供方，但**不回**终止帧 —— 是你自己放弃的，别等 `done`。
-- 宿主手上的 id 是 `stream_id`（`f-N`，就在回复里）。`request_id` 那条路要写内核内部给宿主调用编的号 `host-N`（见 7.7），一般用不上。
-- 取消一个不存在的 id 是无操作: 重复取消、取消一条早就结束的流，都不报错。所以消费者 `break` 的时候顺手取消，是标准动作。
+- **Cancellation is silent**: the kernel stops forwarding and passes `$/cancel` to the provider, but **no** terminal frame comes back, because it was your own decision. Do not wait for `done`.
+- The id a host holds is the `stream_id` (`f-N`, right there in the reply). The `request_id` path needs the `host-N` number the kernel assigns to host calls (see 7.7) and is rarely useful.
+- Cancelling an id that does not exist is a no-op: a repeated cancellation, or one on a stream that ended long ago, reports no error. So cancelling as the consumer `break`s is the standard move.
 
-### 14.3 宿主是纯调用方
+### 14.3 The host is a pure caller
 
-- 内核替宿主写 `meta.caller = "host"`，提供方可以据此分辨这次调用来自宿主还是别的插件。
-- 宿主不提供能力、没有进程、不能当路由目标 —— 配置文件里没有地方能把它写成提供方（`plugins.host` 会被拒绝，见 3.3）。
-- 宿主发起的调用号是 `host-N`（见 7.7）。
-- 宿主受和插件一样的在飞上限，超了回 -32019（overloaded，第 10 节）。
+- The kernel writes `meta.caller = "host"` for the host, so a provider can tell a host call from a plugin call.
+- The host provides no capabilities, has no process and cannot be a routing target. There is nowhere in a config file that can write it as a provider (`plugins.host` is rejected, see 3.3).
+- A host-initiated call is numbered `host-N` (see 7.7).
+- The host is bound by the same in-flight ceiling as plugins, and going past it gets -32019 (overloaded, section 10).
 
-### 14.4 终端归谁
+### 14.4 Whose terminal it is
 
-内核进程的 fd 0 / fd 1 是宿主协议、fd 2 是日志，所以**宿主模式下内核没有终端可以给插件**:
+The kernel process's fd 0 / fd 1 are the host protocol and fd 2 is logs, so **under host mode the kernel has no terminal to give plugins**:
 
-- 宿主发不了 io 原语（`kernel.attach` / `kernel.detach` / `kernel.write`）: 一律 -32601。
-- 插件也 attach 不了: 内核拒绝并回 -32601（"the kernel runs as a host subprocess, so its terminal belongs to the host"）。
-- 想让插件读键盘、写 tty，v1 没有透传通道。这是已知缺口，不是配置问题。
+- A host cannot send the io primitives (`kernel.attach` / `kernel.detach` / `kernel.write`): all -32601.
+- Neither can a plugin attach: the kernel refuses with -32601 ("the kernel runs as a host subprocess, so its terminal belongs to the host").
+- For a plugin that wants to read the keyboard or write to the tty, v1 has no pass-through channel. That is a known gap, not a config problem.
 
-宿主自己的 stdin / Ctrl-C 是宿主进程的事，内核碰不到。
+The host's own stdin and Ctrl-C belong to the host process; the kernel never sees them.
 
-### 14.5 退出与收尸
+### 14.5 Exit and reaping
 
-- 宿主发 `shutdown` → 内核回 `{}` → 跑统一下线（第 5 节）→ 退出。
-- 宿主**关掉 fd 0**（不再发了，或者宿主进程崩了）→ 内核把 EOF 当关机信号，reason = `kernel_exit`，照样干净退出。宿主不需要特地举手告别。
-- 退出码: `0` 干净；`2` 有插件被强杀或有调用没 drain 完；`1` 连不上 —— 配置读不了，或者配置读得了但起不来。
-- 退出码 `1` 时 stderr 上必定有一行 JSON 报告（`ok:false` + `errors` / `warnings` / `plugins` / `capabilities`）。它和日志行混在一起，用 `ok` 字段认它。
-- **绕过 shutdown 直接杀内核进程会留下插件子进程。** 收尸是内核统一下线的一部分。
+- The host sends `shutdown` → the kernel replies `{}` → the unified shutdown runs (section 5) → it exits.
+- The host **closes fd 0** (it stopped sending, or the host process died) → the kernel treats EOF as a shutdown signal with reason = `kernel_exit` and still exits cleanly. A host does not have to raise its hand and say goodbye.
+- Exit codes: `0` clean; `2` some plugin was killed or a call did not drain; `1` could not come up, meaning the config was unreadable, or readable but unbootable.
+- With exit code `1` there is always one JSON report line on stderr (`ok:false` plus `errors` / `warnings` / `plugins` / `capabilities`). It is mixed in with log lines; recognise it by the `ok` field.
+- **Killing the kernel process directly, bypassing shutdown, leaves plugin child processes behind.** Reaping is part of the kernel's unified shutdown.
 
-### 14.6 最小宿主（TypeScript）
+### 14.6 A minimal host (TypeScript)
 
-形状就是这样，没有别的魔法 —— 起进程、按 `Content-Length` 分帧、收发。MaoTa 里那份桥就是这几行的展开版。
+This is the whole shape, no other magic: spawn a process, frame by `Content-Length`, send and receive. The bridge in MaoTa is this expanded over a few more lines.
 
 ```ts
 import { spawn } from "node:child_process";
@@ -1044,14 +1089,14 @@ function request(method: string, params: unknown): Promise<any> {
 }
 
 function onFrame(frame: any) {
-  if (frame.id !== undefined) waiting.get(frame.id)?.(frame); // 回复
-  else dispatchNotification(frame);                          // $/event、$/stream/chunk
+  if (frame.id !== undefined) waiting.get(frame.id)?.(frame); // a reply
+  else dispatchNotification(frame);                          // $/event, $/stream/chunk
 }
 ```
 
-几条照抄就对的细节:
+A few details worth copying exactly:
 
-- fd 2 用 `inherit` 接到宿主自己的 stderr —— 内核日志本来就该落在那里。
-- 一条帧可能跨多个 `data` 事件，也可能一次来好几条: 必须缓冲到完整再解析（上面的循环）。
-- 内核在 fd 0 上读帧、在 fd 1 上写帧（和插件那一侧对称），所以别让它继承宿主自己的 fd 0: `stdio: ["pipe", "pipe", "inherit"]`。
-- `shutdown` 之后不要复用这个内核: 进程会退出去，宿主应该重新 boot。
+- fd 2 uses `inherit` to reach the host's own stderr, which is where kernel logs belong.
+- One frame may span several `data` events, and several frames may arrive at once, so buffer until complete before parsing (the loop above).
+- The kernel reads frames on fd 0 and writes them on fd 1 (symmetric with the plugin side), so do not let it inherit the host's own fd 0: `stdio: ["pipe", "pipe", "inherit"]`.
+- Do not reuse the kernel after `shutdown`: the process exits and the host should boot a new one.

@@ -26,10 +26,10 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use eggshell_kernel::{Host, Kernel};
-use eggshell_loader::Config;
-use eggshell_log as log;
-use eggshell_protocol::{codes, failure, method, parse_frame, read_frame, reason, success, trigger, write_frame, Incoming, RpcError};
+use kernel::{Host, Kernel};
+use loader::Config;
+use logger as log;
+use protocol::{codes, failure, method, parse_frame, read_frame, reason, success, trigger, write_frame, Incoming, RpcError};
 
 /// Frame cap for the host pipe. The plugin pipes keep their own
 /// `max_frame_bytes`; this is the host's limit.
@@ -86,7 +86,7 @@ async fn main() -> ExitCode {
     // config that cannot even be parsed still comes back as a report instead of
     // a bare exit code.
     if check {
-        let report = eggshell_kernel::run(&PathBuf::from(&path), true).await;
+        let report = kernel::run(&PathBuf::from(&path), true).await;
         if json {
             println!("{}", report.to_json());
         } else {

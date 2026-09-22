@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use semver::{Version, VersionReq};
 use serde_json::Value;
 
-use eggshell_protocol::codes;
+use protocol::codes;
 
 pub use crate::route::{Route, RoutingTable};
 #[derive(Debug, Clone, PartialEq)]

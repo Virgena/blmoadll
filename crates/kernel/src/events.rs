@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use eggshell_protocol::method;
+use protocol::method;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {

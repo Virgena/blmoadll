@@ -1,5 +1,5 @@
 [package]
-name = "eggshell-protocol"
+name = "protocol"
 version.workspace = true
 edition.workspace = true
 description = "Wire protocol for eggshellmod: Content-Length framing + JSON-RPC 2.0 message types"

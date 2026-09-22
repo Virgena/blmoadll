@@ -66,7 +66,15 @@ impl std::fmt::Display for ConfigError {
 struct RawPlugin {
     #[serde(default)]
     disabled: bool,
-    command: String,
+    /// The package this row runs, resolved out of the node_modules chain
+    /// that starts at the config file's own directory. Exclusive with
+    /// `command`, which is the raw-program form of the same row.
+    #[serde(default)]
+    name: Option<String>,
+    /// The program to run. A row that names a package gets `node` by
+    /// default; a row that does not must say which program to run.
+    #[serde(default)]
+    command: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
@@ -198,9 +206,9 @@ impl Config {
 
 
 
-        if plugins.contains_key(eggshell_protocol::HOST) {
+        if plugins.contains_key(protocol::HOST) {
             return Err(ConfigError::at(
-                &format!("plugins.{}", eggshell_protocol::HOST),
+                &format!("plugins.{}", protocol::HOST),
                 "this id is reserved for the kernel embedder",
             ));
         }
@@ -335,9 +343,11 @@ fn resolve_from(dir: &Path, target: &str) -> PathBuf {
 }
 
 impl RawPlugin {
-    /// Expands every string, then resolves `command` and `cwd` against the
-    /// config file's directory. `args` are passed through untouched: a plugin's
-    /// own arguments are its business.
+    /// Expands every string, then resolves the row into a program to run and
+    /// the arguments to run it with. A row names either a package (resolved
+    /// out of the node_modules chain above the config file's directory, then
+    /// run with `node`) or a `command`; `cwd` resolves against the config
+    /// file's directory.
     fn resolve(
         &self,
         id: &str,
@@ -345,14 +355,46 @@ impl RawPlugin {
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<PluginSpec, ConfigError> {
         let base = format!("plugins.{id}");
-        if self.command.trim().is_empty() {
-            return Err(ConfigError::at(&format!("{base}.command"), "command must not be empty"));
-        }
-        let command = expand(&self.command, &format!("{base}.command"), env)?;
-        let mut args = Vec::with_capacity(self.args.len());
-        for (index, arg) in self.args.iter().enumerate() {
-            args.push(expand(arg, &format!("{base}.args[{index}]"), env)?);
-        }
+        let (command, args) = match (&self.name, &self.command) {
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::at(
+                    &format!("{base}.name"),
+                    "name and command are alternatives: a row that names a package runs through node",
+                ))
+            }
+            (Some(name), None) => {
+                let name = expand(name, &format!("{base}.name"), env)?;
+                if name.trim().is_empty() {
+                    return Err(ConfigError::at(&format!("{base}.name"), "name must not be empty"));
+                }
+                let entry = resolve_package(&name, dir).map_err(|message| {
+                    ConfigError::at(&format!("{base}.name"), message)
+                })?;
+                let mut args = Vec::with_capacity(self.args.len() + 1);
+                args.push(entry.to_string_lossy().into_owned());
+                for (index, arg) in self.args.iter().enumerate() {
+                    args.push(expand(arg, &format!("{base}.args[{index}]"), env)?);
+                }
+                (PathBuf::from("node"), args)
+            }
+            (None, Some(command)) => {
+                if command.trim().is_empty() {
+                    return Err(ConfigError::at(&format!("{base}.command"), "command must not be empty"));
+                }
+                let command = expand(command, &format!("{base}.command"), env)?;
+                let mut args = Vec::with_capacity(self.args.len());
+                for (index, arg) in self.args.iter().enumerate() {
+                    args.push(expand(arg, &format!("{base}.args[{index}]"), env)?);
+                }
+                (resolve_command(dir, &command), args)
+            }
+            (None, None) => {
+                return Err(ConfigError::at(
+                    &base,
+                    "a row names either a package or a command",
+                ))
+            }
+        };
         let cwd = match &self.cwd {
             Some(cwd) => dir.join(expand(cwd, &format!("{base}.cwd"), env)?),
             None => dir.to_path_buf(),
@@ -363,7 +405,7 @@ impl RawPlugin {
         }
         Ok(PluginSpec {
             id: id.to_string(),
-            command: resolve_command(dir, &command),
+            command,
             args,
             env: expanded,
             cwd,
@@ -381,6 +423,62 @@ impl RawPlugin {
                 max_inflight: self.max_inflight,
             },
         })
+    }
+}
+
+/// The entry file of the package `name`, found the way Node finds it: the
+/// nearest `node_modules/<name>/package.json` at or above `dir`, whose entry
+/// comes from its own manifest. The result is the real file on disk, so a row
+/// that reaches the package through the config directory's link still spawns
+/// the repository copy.
+fn resolve_package(name: &str, dir: &Path) -> Result<PathBuf, String> {
+    if name.starts_with('.') || Path::new(name).is_absolute() {
+        return Err(format!("{name} is not a package name"));
+    }
+    let mut package = None;
+    for ancestor in dir.ancestors() {
+        let candidate = ancestor.join("node_modules").join(name.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if candidate.join("package.json").is_file() {
+            package = Some(candidate);
+            break;
+        }
+    }
+    let package = package.ok_or_else(|| format!("{name} is not installed at or above {}", dir.display()))?;
+    let manifest = std::fs::read_to_string(package.join("package.json"))
+        .map_err(|e| format!("cannot read {name}'s package.json: {e}"))?;
+    let parsed: Value = serde_json::from_str(&manifest)
+        .map_err(|e| format!("{name}'s package.json is not JSON: {e}"))?;
+    let entry = package.join(entry_of(&parsed));
+    if !entry.is_file() {
+        return Err(format!("{name}'s entry {} is missing", entry.display()));
+    }
+    Ok(simplify(entry.canonicalize().unwrap_or(entry)))
+}
+
+/// A package manifest's entry file, in Node's own order: the root export's
+/// `import`, its `default`, the export itself when it is a string, then `main`.
+fn entry_of(manifest: &Value) -> PathBuf {
+    let exports = manifest.get("exports").and_then(|value| value.get("."));
+    let from_exports = exports.and_then(|value| match value {
+        Value::String(path) => Some(path.as_str()),
+        Value::Object(fields) => ["import", "default"]
+            .iter()
+            .find_map(|key| fields.get(*key).and_then(|value| value.as_str())),
+        _ => None,
+    });
+    let path = from_exports
+        .or_else(|| manifest.get("main").and_then(|value| value.as_str()))
+        .unwrap_or("index.js");
+    PathBuf::from(path.trim_start_matches("./"))
+}
+
+/// `canonicalize` answers with a verbatim path on Windows; a drive path with
+/// the `\\?\` prefix taken back off is what every tool here expects.
+fn simplify(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
     }
 }
 
@@ -543,7 +641,8 @@ prefix = "echo: "
 
         let err =
             Config::parse("[plugins.p]\n[capability]\n", Path::new("c.toml"), &env).unwrap_err();
-        assert!(err.message.contains("missing field `command`"), "{}", err.message);
+        // A row with neither key is not a typo hunt: it names nothing to run.
+        assert!(err.message.contains("either a package or a command"), "{}", err.message);
 
         let err = Config::parse("", Path::new("c.toml"), &env).unwrap_err();
         assert!(err.message.contains("no enabled [plugins"), "{}", err.message);
@@ -698,6 +797,114 @@ command = "node"
         )
         .unwrap_err();
         assert_eq!(err.field.unwrap(), "extends");
+    }
+
+    /// Put a package where Node would look for it: `dir/node_modules/<name>`.
+    fn install(dir: &Path, package: &str, manifest: &str, files: &[(&str, &str)]) -> PathBuf {
+        let root = dir.join("node_modules").join(package.replace('/', std::path::MAIN_SEPARATOR_STR));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("package.json"), manifest).unwrap();
+        for (rel, body) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, body).unwrap();
+        }
+        root
+    }
+
+    /// A package installed beside the config is found by walking up the
+    /// node_modules chain, and the row runs that package's own entry.
+    #[test]
+    fn a_row_can_name_a_package_instead_of_a_command() {
+        let dir = scratch("package-row");
+        let installed = install(
+            &dir,
+            "@scope/thing",
+            r#"{ "name": "@scope/thing", "exports": { ".": { "types": "./lib/index.d.ts", "default": "./lib/index.js" } } }"#,
+            &[("lib/index.js", "// entry\n")],
+        );
+        let path = write(
+            &dir.join("eggshell.toml"),
+            "[plugins.thing]\nname = \"@scope/thing\"\nargs = [\"--flag\"]\n",
+        );
+
+        let config = Config::load(&path, &env_of(&[])).unwrap();
+        let row = &config.plugins["thing"];
+        assert_eq!(row.command, PathBuf::from("node"));
+        assert_eq!(row.args[0], installed.join("lib").join("index.js").to_string_lossy());
+        assert_eq!(row.args[1], "--flag");
+        assert_eq!(row.cwd, dir);
+    }
+
+    #[test]
+    fn a_package_is_found_from_an_ancestor_of_the_config() {
+        let dir = scratch("package-ancestor");
+        let installed = install(
+            &dir,
+            "plain",
+            r#"{ "name": "plain", "main": "lib/main.js" }"#,
+            &[("lib/main.js", "// entry\n")],
+        );
+        let nested = dir.join("profiles").join("default");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = write(&nested.join("eggshell.toml"), "[plugins.p]\nname = \"plain\"\n");
+
+        let config = Config::load(&path, &env_of(&[])).unwrap();
+        assert_eq!(
+            config.plugins["p"].args[0],
+            installed.join("lib").join("main.js").to_string_lossy()
+        );
+        // cwd stays the config file's own directory, not the package's.
+        assert_eq!(config.plugins["p"].cwd, nested);
+    }
+
+    #[test]
+    fn a_package_row_reports_a_missing_package_and_a_missing_entry() {
+        let dir = scratch("package-missing");
+        install(&dir, "hollow", r#"{ "name": "hollow" }"#, &[]);
+        let absent = write(&dir.join("absent.toml"), "[plugins.gone]\nname = \"ghost\"\n");
+        let err = Config::load(&absent, &env_of(&[])).unwrap_err();
+        assert_eq!(err.field.unwrap(), "plugins.gone.name");
+        assert!(err.message.contains("ghost"), "{}", err.message);
+
+        let empty = write(&dir.join("empty.toml"), "[plugins.hollow]\nname = \"hollow\"\n");
+        let err = Config::load(&empty, &env_of(&[])).unwrap_err();
+        assert_eq!(err.field.unwrap(), "plugins.hollow.name");
+        assert!(err.message.contains("index.js"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_row_needs_exactly_one_of_name_and_command() {
+        let dir = scratch("package-exclusive");
+        install(&dir, "both", r#"{ "name": "both", "main": "index.js" }"#, &[("index.js", "//\n")]);
+
+        let mixed = write(
+            &dir.join("mixed.toml"),
+            "[plugins.p]\nname = \"both\"\ncommand = \"node\"\n",
+        );
+        let err = Config::load(&mixed, &env_of(&[])).unwrap_err();
+        assert_eq!(err.field.unwrap(), "plugins.p.name");
+        assert!(err.message.contains("alternatives"), "{}", err.message);
+
+        let neither = write(&dir.join("neither.toml"), "[plugins.p]\nargs = []\n");
+        let err = Config::load(&neither, &env_of(&[])).unwrap_err();
+        assert_eq!(err.field.unwrap(), "plugins.p");
+        assert!(err.message.contains("either a package or a command"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_command_row_still_runs_its_own_program() {
+        let dir = scratch("package-command");
+        let path = write(
+            &dir.join("eggshell.toml"),
+            "[plugins.p]\ncommand = \"node\"\nargs = [\"x.js\"]\n",
+        );
+
+        let config = Config::load(&path, &env_of(&[])).unwrap();
+        assert_eq!(config.plugins["p"].command, PathBuf::from("node"));
+        assert_eq!(config.plugins["p"].args, vec!["x.js".to_string()]);
     }
 
     /// The reloader compares this hash, so an edit to any layer has to move it.

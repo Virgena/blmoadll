@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
 
-use eggshell_protocol::codes;
+use protocol::codes;
 
 use crate::kernel::Kernel;
 

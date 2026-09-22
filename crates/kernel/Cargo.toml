@@ -1,5 +1,5 @@
 [package]
-name = "eggshell-kernel"
+name = "kernel"
 version.workspace = true
 edition.workspace = true
 description = "eggshellmod kernel: plugin processes, capability routing, events, hot reload"
@@ -7,9 +7,9 @@ description = "eggshellmod kernel: plugin processes, capability routing, events,
 [dependencies]
 serde_json.workspace = true
 tokio.workspace = true
-eggshell-protocol = { path = "../eggshell-protocol" }
-eggshell-loader = { path = "../eggshell-loader" }
-eggshell-log = { path = "../eggshell-log" }
+protocol = { path = "../protocol" }
+loader = { path = "../loader" }
+logger = { path = "../logger" }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

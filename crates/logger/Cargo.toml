@@ -1,5 +1,5 @@
 [package]
-name = "eggshell-log"
+name = "logger"
 version.workspace = true
 edition.workspace = true
 description = "One JSON object per line on stderr, shared by the kernel and the loader"
