@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use kernel::{Host, Kernel};
 use loader::Config;
@@ -63,7 +63,7 @@ args = ["--provides", "{provides}"{extra}]
 #[tokio::test]
 async fn check_accepts_a_slot_that_is_provided() {
     let dir = scratch("check-ok");
-    let path = config(&dir, &one_provider("demo.text=1.0.0", ""));
+    let path = config(&dir, &one_provider("demo.text", ""));
     let report = kernel::run(&path, true).await;
     assert_eq!(report.code, 0, "{}", report.to_text());
     assert_eq!(report.start_order, vec!["provider".to_string()]);
@@ -73,13 +73,18 @@ async fn check_accepts_a_slot_that_is_provided() {
 #[tokio::test]
 async fn check_rejects_a_slot_nobody_provides() {
     let dir = scratch("check-bad");
-    let path = config(&dir, &format!(r#"
+    let path = config(
+        &dir,
+        &format!(
+            r#"
 [plugins.provider]
 command = '{FIXTURE}'
 
 [capability]
 "demo.text" = "provider"
-"#));
+"#
+        ),
+    );
     let report = kernel::run(&path, true).await;
     assert_eq!(report.code, 1);
     let text = report.to_text();
@@ -89,13 +94,19 @@ command = '{FIXTURE}'
 #[tokio::test]
 async fn the_host_can_call_a_capability() {
     let dir = scratch("invoke");
-    let path = config(&dir, &one_provider("demo.text=1.0.0", ""));
+    let path = config(&dir, &one_provider("demo.text", ""));
     let kernel = boot(&path).await;
 
-    let reply = kernel.invoke("demo.text", "echo", json!({"hi": 1})).await.expect("call");
+    let reply = kernel
+        .invoke("demo.text", "echo", json!({"hi": 1}))
+        .await
+        .expect("call");
     assert_eq!(reply["got"]["hi"], json!(1));
 
-    let error = kernel.invoke("demo.nope", "echo", json!({})).await.unwrap_err();
+    let error = kernel
+        .invoke("demo.nope", "echo", json!({}))
+        .await
+        .unwrap_err();
     assert_eq!(error.code, -32010);
 
     assert_eq!(stop(&kernel).await, 0);
@@ -104,11 +115,14 @@ async fn the_host_can_call_a_capability() {
 #[tokio::test]
 async fn the_host_receives_ordered_chunks_and_one_terminal_block() {
     let dir = scratch("stream");
-    let path = config(&dir, &one_provider("demo.text=1.0.0", r#", "--chunks", "3""#));
+    let path = config(&dir, &one_provider("demo.text", r#", "--chunks", "3""#));
     let kernel = boot(&path).await;
     let mut host = kernel.host().expect("host channel");
 
-    let reply = kernel.invoke_stream("demo.text", "chat", json!({})).await.expect("stream");
+    let reply = kernel
+        .invoke_stream("demo.text", "chat", json!({}))
+        .await
+        .expect("stream");
     let stream_id = reply["stream_id"].as_str().expect("stream id").to_string();
 
     let mut chunks = Vec::new();
@@ -129,22 +143,29 @@ async fn the_host_receives_ordered_chunks_and_one_terminal_block() {
 #[tokio::test]
 async fn a_provider_that_dies_does_not_take_the_kernel_with_it() {
     let dir = scratch("crash");
-    let path = config(&dir, &format!(r#"
+    let path = config(
+        &dir,
+        &format!(
+            r#"
 [plugins.doomed]
 command = '{FIXTURE}'
-args = ["--provides", "demo.text=1.0.0", "--exit-on-invoke"]
+args = ["--provides", "demo.text", "--exit-on-invoke"]
 
 [plugins.healthy]
 command = '{FIXTURE}'
-args = ["--provides", "demo.other=1.0.0"]
+args = ["--provides", "demo.other"]
 
 [capability]
 "demo.text" = "doomed"
 "demo.other" = "healthy"
-"#));
+"#
+        ),
+    );
     let kernel = boot(&path).await;
     let mut host = kernel.host().expect("host channel");
-    kernel.subscribe(&["kernel.plugin.*".to_string()], true).expect("subscribe");
+    kernel
+        .subscribe(&["kernel.plugin.*".to_string()], true)
+        .expect("subscribe");
 
     let mut replayed: Vec<String> = Vec::new();
     for _ in 0..2 {
@@ -154,16 +175,27 @@ args = ["--provides", "demo.other=1.0.0"]
         assert!(event["params"]["payload"]["cwd"].is_string());
         assert!(event["params"]["payload"]["command"].is_string());
         assert!(event["params"]["payload"]["args"].is_array());
-        replayed.push(event["params"]["payload"]["plugin"].as_str().unwrap().to_string());
+        replayed.push(
+            event["params"]["payload"]["plugin"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
     }
     replayed.sort();
     assert_eq!(replayed, ["doomed", "healthy"]);
 
-    let error = kernel.invoke("demo.text", "echo", json!({})).await.unwrap_err();
+    let error = kernel
+        .invoke("demo.text", "echo", json!({}))
+        .await
+        .unwrap_err();
     assert_eq!(error.code, -32011);
 
     // The dead provider keeps its slot and answers with the same code.
-    let again = kernel.invoke("demo.text", "echo", json!({})).await.unwrap_err();
+    let again = kernel
+        .invoke("demo.text", "echo", json!({}))
+        .await
+        .unwrap_err();
     assert_eq!(again.code, -32011);
 
     // The rest of the kernel is unaffected.

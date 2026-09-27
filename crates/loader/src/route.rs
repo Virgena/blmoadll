@@ -1,5 +1,4 @@
-//! What the kernel knows about capabilities: which plugin serves one, and at
-//! which version.
+//! What the kernel knows about capabilities: which plugin serves one.
 //!
 //! Nothing here knows what a capability *means*. The ids are opaque strings the
 //! loader read out of a config file.
@@ -9,7 +8,6 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route {
     pub plugin: String,
-    pub version: String,
 }
 
 /// Capability id -> the plugin that serves it.
@@ -21,7 +19,7 @@ pub fn to_json(table: &RoutingTable) -> serde_json::Value {
     for (capability, route) in table {
         object.insert(
             capability.clone(),
-            serde_json::json!({ "plugin": route.plugin, "version": route.version }),
+            serde_json::json!({ "plugin": route.plugin }),
         );
     }
     serde_json::Value::Object(object)

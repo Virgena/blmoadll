@@ -64,28 +64,72 @@ pub struct Limits {
     pub io_line_bytes: usize,
 }
 
-fn d_initialize_timeout() -> u64 { 5_000 }
-fn d_start_timeout() -> u64 { 10_000 }
-fn d_shutdown_grace() -> u64 { 5_000 }
-fn d_request_timeout() -> u64 { 30_000 }
-fn d_stream_idle_timeout() -> u64 { 30_000 }
-fn d_max_frame_bytes() -> usize { 64 * MIB }
-fn d_event_payload_bytes() -> usize { 256 * 1024 }
-fn d_event_queue_len() -> usize { 1024 }
-fn d_event_queue_bytes() -> usize { 4 * MIB }
-fn d_outbound_queue_bytes() -> usize { 4 * MIB }
-fn d_io_write_queue_bytes() -> usize { 4 * MIB }
-fn d_queue_high_water() -> usize { 2 * MIB }
-fn d_queue_low_water() -> usize { 1 * MIB }
-fn d_stream_buffer_chunks() -> usize { 4096 }
-fn d_stream_buffer_bytes() -> usize { 8 * MIB }
-fn d_max_inflight() -> usize { 64 }
-fn d_max_inflight_total() -> usize { 1024 }
-fn d_drain_ms() -> u64 { 5_000 }
-fn d_io_eof_idle_ms() -> u64 { 500 }
-fn d_max_plugins() -> usize { 64 }
-fn d_log_line_bytes() -> usize { 8 * 1024 }
-fn d_io_line_bytes() -> usize { 8 * 1024 }
+fn d_initialize_timeout() -> u64 {
+    5_000
+}
+fn d_start_timeout() -> u64 {
+    10_000
+}
+fn d_shutdown_grace() -> u64 {
+    5_000
+}
+fn d_request_timeout() -> u64 {
+    30_000
+}
+fn d_stream_idle_timeout() -> u64 {
+    30_000
+}
+fn d_max_frame_bytes() -> usize {
+    64 * MIB
+}
+fn d_event_payload_bytes() -> usize {
+    256 * 1024
+}
+fn d_event_queue_len() -> usize {
+    1024
+}
+fn d_event_queue_bytes() -> usize {
+    4 * MIB
+}
+fn d_outbound_queue_bytes() -> usize {
+    4 * MIB
+}
+fn d_io_write_queue_bytes() -> usize {
+    4 * MIB
+}
+fn d_queue_high_water() -> usize {
+    2 * MIB
+}
+fn d_queue_low_water() -> usize {
+    1 * MIB
+}
+fn d_stream_buffer_chunks() -> usize {
+    4096
+}
+fn d_stream_buffer_bytes() -> usize {
+    8 * MIB
+}
+fn d_max_inflight() -> usize {
+    64
+}
+fn d_max_inflight_total() -> usize {
+    1024
+}
+fn d_drain_ms() -> u64 {
+    5_000
+}
+fn d_io_eof_idle_ms() -> u64 {
+    500
+}
+fn d_max_plugins() -> usize {
+    64
+}
+fn d_log_line_bytes() -> usize {
+    8 * 1024
+}
+fn d_io_line_bytes() -> usize {
+    8 * 1024
+}
 
 impl Default for Limits {
     fn default() -> Self {
@@ -136,7 +180,8 @@ pub struct Timeouts {
 
 impl Timeouts {
     pub fn initialize(&self, limits: &Limits) -> u64 {
-        self.initialize_timeout_ms.unwrap_or(limits.initialize_timeout_ms)
+        self.initialize_timeout_ms
+            .unwrap_or(limits.initialize_timeout_ms)
     }
 
     pub fn start(&self, limits: &Limits) -> u64 {
@@ -152,7 +197,8 @@ impl Timeouts {
     }
 
     pub fn stream_idle(&self, limits: &Limits) -> u64 {
-        self.stream_idle_timeout_ms.unwrap_or(limits.stream_idle_timeout_ms)
+        self.stream_idle_timeout_ms
+            .unwrap_or(limits.stream_idle_timeout_ms)
     }
 
     pub fn max_inflight(&self, limits: &Limits) -> usize {
@@ -193,10 +239,12 @@ mod tests {
     #[test]
     fn per_plugin_overrides_win_over_defaults() {
         let limits = Limits::default();
-        let timeouts = Timeouts { start_timeout_ms: Some(1), ..Default::default() };
+        let timeouts = Timeouts {
+            start_timeout_ms: Some(1),
+            ..Default::default()
+        };
         assert_eq!(timeouts.start(&limits), 1);
         assert_eq!(timeouts.initialize(&limits), limits.initialize_timeout_ms);
         assert_eq!(timeouts.max_inflight(&limits), limits.max_inflight);
     }
 }
-

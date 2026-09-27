@@ -1,11 +1,11 @@
 //! Topic-based broadcast bus. The kernel relays; plugins only ever see events.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use protocol::method;
 
@@ -120,7 +120,11 @@ impl EventBus {
         let mut subs = self.subs.lock().unwrap();
 
         for sub in subs.values_mut() {
-            if !sub.patterns.iter().any(|pattern| matches_topic(pattern, topic)) {
+            if !sub
+                .patterns
+                .iter()
+                .any(|pattern| matches_topic(pattern, topic))
+            {
                 continue;
             }
             if sub.count + 1 > limits.len || sub.bytes + size > limits.bytes {
@@ -186,7 +190,10 @@ mod tests {
     use super::*;
 
     fn limits() -> Budget {
-        Budget { len: 2, bytes: 4096 }
+        Budget {
+            len: 2,
+            bytes: 4096,
+        }
     }
 
     #[test]
@@ -194,7 +201,10 @@ mod tests {
         assert!(matches_topic("demo.*", "demo.turn"));
         assert!(!matches_topic("demo.*", "demo.turn.started"));
         assert!(!matches_topic("demo.*", "loops.turn"));
-        assert!(matches_topic("kernel.plugin.started", "kernel.plugin.started"));
+        assert!(matches_topic(
+            "kernel.plugin.started",
+            "kernel.plugin.started"
+        ));
         assert!(matches_topic("*.*", "demo.turn"));
         assert!(!matches_topic("**", "demo.turn"));
     }
@@ -212,7 +222,10 @@ mod tests {
         let first = events[0].frame["params"]["seq"].as_u64().unwrap();
 
         let (events, _) = bus.deliver("demo.turn", &payload, 8, &limits());
-        assert_eq!(events[0].frame["params"]["seq"].as_u64().unwrap(), first + 1);
+        assert_eq!(
+            events[0].frame["params"]["seq"].as_u64().unwrap(),
+            first + 1
+        );
     }
 
     #[test]
@@ -226,10 +239,19 @@ mod tests {
         let (events, notices) = bus.deliver("demo.turn", &payload, 8, &limits());
         assert!(events.is_empty());
         assert_eq!(notices.len(), 1);
-        assert_eq!(notices[0].frame["params"]["topic"], json!("kernel.event.dropped"));
+        assert_eq!(
+            notices[0].frame["params"]["topic"],
+            json!("kernel.event.dropped")
+        );
         assert_eq!(notices[0].frame["params"]["seq"], json!(0));
-        assert_eq!(notices[0].frame["params"]["payload"]["subscription_id"], json!(id));
-        assert_eq!(notices[0].frame["params"]["payload"]["dropped_count"], json!(1));
+        assert_eq!(
+            notices[0].frame["params"]["payload"]["subscription_id"],
+            json!(id)
+        );
+        assert_eq!(
+            notices[0].frame["params"]["payload"]["dropped_count"],
+            json!(1)
+        );
 
         let (_, again) = bus.deliver("demo.turn", &payload, 8, &limits());
         assert!(again.is_empty(), "drop notices must be rate limited");
@@ -245,12 +267,19 @@ mod tests {
         let id = bus.subscribe("subscriber", vec!["demo.*".to_string()]);
         assert!(bus.unsubscribe(id));
         assert!(!bus.unsubscribe(id));
-        assert!(bus.deliver("demo.turn", &json!({}), 2, &limits()).0.is_empty());
+        assert!(
+            bus.deliver("demo.turn", &json!({}), 2, &limits())
+                .0
+                .is_empty()
+        );
 
         bus.subscribe("subscriber", vec!["demo.*".to_string()]);
         bus.subscribe("subscriber", vec!["kernel.*".to_string()]);
         assert_eq!(bus.remove_plugin("subscriber").len(), 2);
-        assert!(bus.deliver("demo.turn", &json!({}), 2, &limits()).0.is_empty());
+        assert!(
+            bus.deliver("demo.turn", &json!({}), 2, &limits())
+                .0
+                .is_empty()
+        );
     }
 }
-

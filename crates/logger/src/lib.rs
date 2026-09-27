@@ -5,11 +5,11 @@
 //! contract. Both the kernel and the loader write through this.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 0 = quiet (errors only), 1 = info, 2 = debug.
 static LEVEL: AtomicU8 = AtomicU8::new(1);
@@ -80,7 +80,12 @@ pub fn debug(target: &str, message: &str) {
 /// Forwards one line of a plugin's stderr, truncated at `limit` bytes.
 pub fn plugin_stderr(plugin: &str, line: &str, limit: usize) {
     let message = truncate(line, limit);
-    emit("info", "plugin.stderr", &message, json!({ "plugin": plugin }));
+    emit(
+        "info",
+        "plugin.stderr",
+        &message,
+        json!({ "plugin": plugin }),
+    );
 }
 
 /// Byte-safe truncation with a visible marker.

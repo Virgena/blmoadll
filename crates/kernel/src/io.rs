@@ -3,8 +3,8 @@
 //! This is a transport layer, not an Agent capability. The kernel multiplexes
 //! its own stdin/stdout between plugins; it still has no idea what a "UI" is.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, watch};
@@ -102,5 +102,3 @@ pub fn start_stdin(kernel: Arc<Kernel>, attached: watch::Receiver<bool>, chunk: 
         }
     });
 }
-
-

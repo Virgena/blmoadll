@@ -9,7 +9,7 @@ pub mod frame;
 pub mod msg;
 
 /// Protocol version carried by `initialize`. A mismatch is `-32015`.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// JSON-RPC method names of the kernel <-> plugin protocol.
 pub mod method {
@@ -57,8 +57,8 @@ pub mod trigger {
     pub const MANUAL: &str = "manual";
 }
 
-pub use frame::{read_frame, write_frame, FrameError};
-pub use msg::{failure, notify, parse_frame, request, success, Incoming, RpcError};
+pub use frame::{FrameError, read_frame, write_frame};
+pub use msg::{Incoming, RpcError, failure, notify, parse_frame, request, success};
 
 /// The caller label the kernel writes for the embedder. A plugin may not use it:
 /// the loader refuses a config that defines a plugin with this id.

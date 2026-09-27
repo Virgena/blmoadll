@@ -1,7 +1,7 @@
 //! JSON-RPC 2.0 envelopes. Params and results stay opaque `Value`s: the kernel
 //! has no idea what is inside them.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::codes;
 
@@ -14,11 +14,19 @@ pub struct RpcError {
 
 impl RpcError {
     pub fn new(code: i64, message: impl Into<String>) -> Self {
-        RpcError { code, message: message.into(), data: None }
+        RpcError {
+            code,
+            message: message.into(),
+            data: None,
+        }
     }
 
     pub fn with_data(code: i64, message: impl Into<String>, data: Value) -> Self {
-        RpcError { code, message: message.into(), data: Some(data) }
+        RpcError {
+            code,
+            message: message.into(),
+            data: Some(data),
+        }
     }
 
     pub fn to_value(&self) -> Value {
@@ -31,7 +39,10 @@ impl RpcError {
 
     pub fn from_value(v: &Value) -> RpcError {
         RpcError {
-            code: v.get("code").and_then(Value::as_i64).unwrap_or(codes::INTERNAL_ERROR),
+            code: v
+                .get("code")
+                .and_then(Value::as_i64)
+                .unwrap_or(codes::INTERNAL_ERROR),
             message: v
                 .get("message")
                 .and_then(Value::as_str)
@@ -44,16 +55,31 @@ impl RpcError {
 
 #[derive(Debug)]
 pub enum Incoming {
-    Request { id: Value, method: String, params: Value },
-    Notification { method: String, params: Value },
-    Response { id: Value, result: Value },
-    ErrorResponse { id: Value, error: RpcError },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Response {
+        id: Value,
+        result: Value,
+    },
+    ErrorResponse {
+        id: Value,
+        error: RpcError,
+    },
 }
 
 impl Incoming {
     pub fn method(&self) -> Option<&str> {
         match self {
-            Incoming::Request { method, .. } | Incoming::Notification { method, .. } => Some(method),
+            Incoming::Request { method, .. } | Incoming::Notification { method, .. } => {
+                Some(method)
+            }
             _ => None,
         }
     }
@@ -79,16 +105,24 @@ pub fn parse_frame(payload: &[u8]) -> Result<Incoming, RpcError> {
 
     if let Some(err) = obj.get("error") {
         let id = obj.get("id").cloned().unwrap_or(Value::Null);
-        return Ok(Incoming::ErrorResponse { id, error: RpcError::from_value(err) });
+        return Ok(Incoming::ErrorResponse {
+            id,
+            error: RpcError::from_value(err),
+        });
     }
 
     if let Some(method) = obj.get("method").and_then(Value::as_str) {
         let params = obj.get("params").cloned().unwrap_or(Value::Null);
         return Ok(match obj.get("id") {
-            Some(id) if !id.is_null() => {
-                Incoming::Request { id: id.clone(), method: method.to_string(), params }
-            }
-            _ => Incoming::Notification { method: method.to_string(), params },
+            Some(id) if !id.is_null() => Incoming::Request {
+                id: id.clone(),
+                method: method.to_string(),
+                params,
+            },
+            _ => Incoming::Notification {
+                method: method.to_string(),
+                params,
+            },
         });
     }
 
@@ -97,7 +131,10 @@ pub fn parse_frame(payload: &[u8]) -> Result<Incoming, RpcError> {
             id: id.clone(),
             result: obj.get("result").cloned().unwrap_or(Value::Null),
         }),
-        None => Err(RpcError::new(codes::INVALID_REQUEST, "neither method nor id")),
+        None => Err(RpcError::new(
+            codes::INVALID_REQUEST,
+            "neither method nor id",
+        )),
     }
 }
 
@@ -123,7 +160,8 @@ mod tests {
 
     #[test]
     fn parses_request_notification_and_response() {
-        match parse_frame(br#"{"jsonrpc":"2.0","id":7,"method":"invoke","params":{"a":1}}"#).unwrap()
+        match parse_frame(br#"{"jsonrpc":"2.0","id":7,"method":"invoke","params":{"a":1}}"#)
+            .unwrap()
         {
             Incoming::Request { id, method, params } => {
                 assert_eq!(id, json!(7));
@@ -172,8 +210,14 @@ mod tests {
 
     #[test]
     fn rejects_garbage_and_non_objects() {
-        assert_eq!(parse_frame(b"not json").unwrap_err().code, codes::PARSE_ERROR);
-        assert_eq!(parse_frame(b"[1,2]").unwrap_err().code, codes::INVALID_REQUEST);
+        assert_eq!(
+            parse_frame(b"not json").unwrap_err().code,
+            codes::PARSE_ERROR
+        );
+        assert_eq!(
+            parse_frame(b"[1,2]").unwrap_err().code,
+            codes::INVALID_REQUEST
+        );
     }
 
     #[test]
@@ -192,4 +236,3 @@ mod tests {
         assert_eq!(err["error"]["code"], json!(codes::OVERLOADED));
     }
 }
-

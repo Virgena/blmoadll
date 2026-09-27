@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use semver::{Version, VersionReq};
 use serde_json::Value;
 
 use protocol::codes;
@@ -15,14 +14,13 @@ pub use crate::route::{Route, RoutingTable};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Req {
     pub capability: String,
-    pub version: String,
     pub optional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decl {
     pub id: String,
-    pub provides: Vec<(String, String)>,
+    pub provides: Vec<String>,
     pub requires: Vec<Req>,
 }
 
@@ -35,11 +33,19 @@ pub struct Issue {
 
 impl Issue {
     pub fn error(code: i64, message: impl Into<String>) -> Self {
-        Issue { code, message: message.into(), field: None }
+        Issue {
+            code,
+            message: message.into(),
+            field: None,
+        }
     }
 
     pub fn warning(message: impl Into<String>) -> Self {
-        Issue { code: codes::INVALID_CONFIG, message: message.into(), field: None }
+        Issue {
+            code: codes::INVALID_CONFIG,
+            message: message.into(),
+            field: None,
+        }
     }
 
     pub fn at(mut self, field: impl Into<String>) -> Self {
@@ -63,57 +69,64 @@ pub fn decl_from_initialize(id: &str, params: &Value) -> Result<Decl, Issue> {
     let provides_raw = params
         .get("provides")
         .and_then(Value::as_array)
-        .ok_or_else(|| Issue::error(codes::INVALID_PARAMS, "initialize reply has no `provides` array"))?;
+        .ok_or_else(|| {
+            Issue::error(
+                codes::INVALID_PARAMS,
+                "initialize reply has no `provides` array",
+            )
+        })?;
     let requires_raw = params
         .get("requires")
         .and_then(Value::as_array)
-        .ok_or_else(|| Issue::error(codes::INVALID_PARAMS, "initialize reply has no `requires` array"))?;
+        .ok_or_else(|| {
+            Issue::error(
+                codes::INVALID_PARAMS,
+                "initialize reply has no `requires` array",
+            )
+        })?;
 
     let mut provides = Vec::new();
     for item in provides_raw {
-        let capability = item.get("capability").and_then(Value::as_str).ok_or_else(|| {
-            Issue::error(codes::INVALID_PARAMS, "provides[] entry without `capability`")
-        })?;
-        let version = item.get("version").and_then(Value::as_str).ok_or_else(|| {
-            Issue::error(codes::INVALID_PARAMS, "provides[] entry without `version`")
-        })?;
-        if let Err(e) = Version::parse(version) {
-            return Err(Issue::error(
+        let capability = item.as_str().ok_or_else(|| {
+            Issue::error(
                 codes::INVALID_PARAMS,
-                format!("provided version {version:?} of {capability} is not semver: {e}"),
-            ));
-        }
-        provides.push((capability.to_string(), version.to_string()));
+                "provides[] entry must be a capability id",
+            )
+        })?;
+        provides.push(capability.to_string());
     }
 
     let mut requires = Vec::new();
     for item in requires_raw {
-        let capability = item.get("capability").and_then(Value::as_str).ok_or_else(|| {
-            Issue::error(codes::INVALID_PARAMS, "requires[] entry without `capability`")
-        })?;
-        let version = item.get("version").and_then(Value::as_str).ok_or_else(|| {
-            Issue::error(codes::INVALID_PARAMS, "requires[] entry without `version`")
-        })?;
-        if let Err(e) = VersionReq::parse(version) {
-            return Err(Issue::error(
-                codes::INVALID_PARAMS,
-                format!("required range {version:?} of {capability} is not supported: {e}"),
-            ));
-        }
+        let capability = item
+            .get("capability")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Issue::error(
+                    codes::INVALID_PARAMS,
+                    "requires[] entry without `capability`",
+                )
+            })?;
         requires.push(Req {
             capability: capability.to_string(),
-            version: version.to_string(),
-            optional: item.get("optional").and_then(Value::as_bool).unwrap_or(false),
+            optional: item
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         });
     }
 
-    Ok(Decl { id: id.to_string(), provides, requires })
+    Ok(Decl {
+        id: id.to_string(),
+        provides,
+        requires,
+    })
 }
 
-pub fn satisfies(range: &str, version: &str) -> Result<bool, String> {
-    let req = VersionReq::parse(range).map_err(|e| format!("bad range {range:?}: {e}"))?;
-    let ver = Version::parse(version).map_err(|e| format!("bad version {version:?}: {e}"))?;
-    Ok(req.matches(&ver))
+/// Whether a routing table serves `req`: the capability is all a dependency
+/// is, so a provider either is in the table or is not.
+fn serves(table: &RoutingTable, req: &Req) -> bool {
+    table.contains_key(&req.capability)
 }
 
 /// Cross-checks config against plugin declarations and builds the routing table.
@@ -166,7 +179,9 @@ pub fn validate(
 
         if unserved.is_empty() {
             for (id, missing) in &blocked {
-                report.warnings.extend(blocking_issues(all[id.as_str()], missing, &report.table));
+                report
+                    .warnings
+                    .extend(blocking_issues(all[id.as_str()], missing, &report.table));
             }
             report.blocked = blocked;
             return report;
@@ -178,36 +193,16 @@ pub fn validate(
     }
 }
 
-/// Whether a routing table has a provider of `req` at a version it accepts.
-fn serves(table: &RoutingTable, req: &Req) -> bool {
-    let Some(route) = table.get(&req.capability) else {
-        return false;
-    };
-    matches!(satisfies(&req.version, &route.version), Ok(true))
-}
-
 /// One warning per capability a waiting plugin cannot reach.
 fn blocking_issues(decl: &Decl, missing: &[String], table: &RoutingTable) -> Vec<Issue> {
     missing
         .iter()
         .map(|capability| {
-            let range = decl
-                .requires
-                .iter()
-                .find(|req| &req.capability == capability)
-                .map(|req| req.version.clone())
-                .unwrap_or_default();
-            match table.get(capability) {
-                Some(route) => Issue::warning(format!(
-                    "`{}` was not started: `{}` provides `{capability}` {} but `{}` requires {range}",
-                    decl.id, route.plugin, route.version, decl.id
-                )),
-                None => Issue::warning(format!(
-                    "`{}` was not started: no provider is configured for `{capability}`{}",
-                    decl.id,
-                    closest(capability, table.keys().map(String::as_str))
-                )),
-            }
+            Issue::warning(format!(
+                "`{}` was not started: no provider is configured for `{capability}`{}",
+                decl.id,
+                closest(capability, table.keys().map(String::as_str))
+            ))
         })
         .collect()
 }
@@ -231,8 +226,11 @@ fn build_table(
 
     for (slot, plugin) in pins {
         let Some(decl) = all.get(plugin.as_str()) else {
-            let reason =
-                if disabled.contains(plugin) { "is disabled" } else { "is not configured" };
+            let reason = if disabled.contains(plugin) {
+                "is disabled"
+            } else {
+                "is not configured"
+            };
             report.warnings.push(pin_issue(slot, plugin, reason));
             continue;
         };
@@ -240,47 +238,42 @@ fn build_table(
             report.warnings.push(pin_issue(slot, plugin, "is blocked"));
             continue;
         }
-        match decl.provides.iter().find(|(cap, _)| cap == slot) {
-            Some((_, version)) => {
-                report.table.insert(
-                    slot.clone(),
-                    Route { plugin: plugin.clone(), version: version.clone() },
-                );
-            }
-            None => {
-                let offered = if decl.provides.is_empty() {
-                    "nothing".to_string()
-                } else {
-                    decl.provides
-                        .iter()
-                        .map(|(c, v)| format!("{c} {v}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                let hint = closest(slot, decl.provides.iter().map(|(c, _)| c.as_str()));
-                report.errors.push(
-                    Issue::error(
-                        codes::INVALID_CONFIG,
-                        format!(
-                            "`{plugin}` does not provide `{slot}`; it provides {offered}{}",
-                            hint
-                        ),
-                    )
-                    .at(format!("capability.{slot}")),
-                );
-            }
+        if decl.provides.iter().any(|cap| cap == slot) {
+            report.table.insert(
+                slot.clone(),
+                Route {
+                    plugin: plugin.clone(),
+                },
+            );
+        } else {
+            let offered = if decl.provides.is_empty() {
+                "nothing".to_string()
+            } else {
+                decl.provides.join(", ")
+            };
+            let hint = closest(slot, decl.provides.iter().map(String::as_str));
+            report.errors.push(
+                Issue::error(
+                    codes::INVALID_CONFIG,
+                    format!(
+                        "`{plugin}` does not provide `{slot}`; it provides {offered}{}",
+                        hint
+                    ),
+                )
+                .at(format!("capability.{slot}")),
+            );
         }
     }
 
     // Whatever the pins did not settle: one provider needs no decision, two
     // need the config to say which one.
-    let mut offered: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+    let mut offered: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for decl in active {
-        for (cap, version) in &decl.provides {
+        for cap in &decl.provides {
             offered
                 .entry(cap.as_str())
                 .or_default()
-                .push((decl.id.as_str(), version.as_str()));
+                .push(decl.id.as_str());
         }
     }
     for (cap, providers) in &offered {
@@ -288,16 +281,17 @@ fn build_table(
             continue;
         }
         if providers.len() == 1 {
-            let (id, version) = providers[0];
             report.table.insert(
                 cap.to_string(),
-                Route { plugin: id.to_string(), version: version.to_string() },
+                Route {
+                    plugin: providers[0].to_string(),
+                },
             );
             continue;
         }
         let names = providers
             .iter()
-            .map(|(id, _)| format!("`{id}`"))
+            .map(|id| format!("`{id}`"))
             .collect::<Vec<_>>()
             .join(" and ");
         report.errors.push(
@@ -305,22 +299,11 @@ fn build_table(
                 codes::INVALID_CONFIG,
                 format!(
                     "`{cap}` is offered by {names}; add capability.\"{cap}\" = \"{}\" to pick one",
-                    providers[0].0
+                    providers[0]
                 ),
             )
             .at(format!("capability.{cap}")),
         );
-    }
-
-    for decl in active {
-        for (cap, version) in &decl.provides {
-            if let Err(e) = Version::parse(version) {
-                report.errors.push(Issue::error(
-                    codes::INVALID_CONFIG,
-                    format!("`{}` declares `{cap}` version {version:?}, which is not semver: {e}", decl.id),
-                ));
-            }
-        }
     }
 
     let mut used: BTreeSet<String> = BTreeSet::new();
@@ -333,19 +316,12 @@ fn build_table(
             if !req.optional {
                 continue;
             }
-            let message = match report.table.get(&req.capability) {
-                Some(route) => format!(
-                    "`{}` requires `{}` {} but `{}` provides {}",
-                    decl.id, req.capability, req.version, route.plugin, route.version
-                ),
-                None => format!(
-                    "`{}` requires `{}` but no provider is configured{}",
-                    decl.id,
-                    req.capability,
-                    closest(&req.capability, report.table.keys().map(String::as_str))
-                ),
-            };
-            report.warnings.push(Issue::warning(format!("optional dependency skipped: {message}")));
+            report.warnings.push(Issue::warning(format!(
+                "optional dependency skipped: `{}` requires `{}` but no provider is configured{}",
+                decl.id,
+                req.capability,
+                closest(&req.capability, report.table.keys().map(String::as_str))
+            )));
         }
     }
 
@@ -369,7 +345,9 @@ pub fn start_order(decls: &[Decl], table: &RoutingTable) -> Result<Vec<String>, 
 
     for decl in decls {
         for req in &decl.requires {
-            let Some(route) = table.get(&req.capability) else { continue };
+            let Some(route) = table.get(&req.capability) else {
+                continue;
+            };
             if route.plugin == decl.id {
                 continue;
             }
@@ -408,7 +386,10 @@ pub fn start_order(decls: &[Decl], table: &RoutingTable) -> Result<Vec<String>, 
         return Ok(order);
     }
 
-    let remaining: BTreeSet<String> = ids.difference(&order.iter().cloned().collect()).cloned().collect();
+    let remaining: BTreeSet<String> = ids
+        .difference(&order.iter().cloned().collect())
+        .cloned()
+        .collect();
     let mut path = Vec::new();
     let mut seen = BTreeSet::new();
     let mut cursor = remaining.iter().next().cloned().unwrap();
@@ -461,7 +442,9 @@ fn edit_distance(a: &str, b: &str) -> usize {
         current[0] = i + 1;
         for (j, cb) in b.iter().enumerate() {
             let cost = if ca == cb { 0 } else { 1 };
-            current[j + 1] = (previous[j] + cost).min(previous[j + 1] + 1).min(current[j] + 1);
+            current[j + 1] = (previous[j] + cost)
+                .min(previous[j + 1] + 1)
+                .min(current[j] + 1);
         }
         std::mem::swap(&mut previous, &mut current);
     }
@@ -473,15 +456,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn decl(id: &str, provides: &[(&str, &str)], requires: &[(&str, &str, bool)]) -> Decl {
+    fn decl(id: &str, provides: &[&str], requires: &[(&str, bool)]) -> Decl {
         Decl {
             id: id.to_string(),
-            provides: provides.iter().map(|(c, v)| (c.to_string(), v.to_string())).collect(),
+            provides: provides.iter().map(|c| c.to_string()).collect(),
             requires: requires
                 .iter()
-                .map(|(c, v, o)| Req {
+                .map(|(c, o)| Req {
                     capability: c.to_string(),
-                    version: v.to_string(),
                     optional: *o,
                 })
                 .collect(),
@@ -489,67 +471,82 @@ mod tests {
     }
 
     fn slots(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(c, p)| (c.to_string(), p.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(c, p)| (c.to_string(), p.to_string()))
+            .collect()
     }
-
 
     fn check(decls: &[Decl], pins: &BTreeMap<String, String>) -> Report {
         validate(decls, pins, &BTreeSet::new())
     }
 
-    fn check_off(
-        decls: &[Decl],
-        pins: &BTreeMap<String, String>,
-        disabled: &[&str],
-    ) -> Report {
+    fn check_off(decls: &[Decl], pins: &BTreeMap<String, String>, disabled: &[&str]) -> Report {
         let disabled: BTreeSet<String> = disabled.iter().map(|id| id.to_string()).collect();
         validate(decls, pins, &disabled)
     }
+
     #[test]
     fn reads_declarations_from_an_initialize_reply() {
         let params = json!({
             "protocol": 1,
-            "provides": [{"capability": "demo.text", "version": "1.0.0"}],
+            "provides": ["demo.text"],
             "requires": [
-                {"capability": "demo.store", "version": ">=1.0.0, <2.0.0"},
-                {"capability": "demo.tools", "version": "^1", "optional": true},
+                {"capability": "demo.store"},
+                {"capability": "demo.tools", "optional": true},
             ],
         });
         let parsed = decl_from_initialize("consumer", &params).unwrap();
-        assert_eq!(parsed.provides, vec![("demo.text".to_string(), "1.0.0".to_string())]);
+        assert_eq!(parsed.provides, vec!["demo.text".to_string()]);
+        assert_eq!(parsed.requires[0].capability, "demo.store");
         assert_eq!(parsed.requires[0].optional, false);
         assert_eq!(parsed.requires[1].optional, true);
 
         assert!(decl_from_initialize("x", &json!({"provides": []})).is_err());
-        assert!(decl_from_initialize("x", &json!({"provides": [{"capability": "a", "version": "nope"}], "requires": []})).is_err());
-        // `||` is not part of the supported subset.
-        assert!(decl_from_initialize(
-            "x",
-            &json!({"provides": [], "requires": [{"capability": "a", "version": ">=1.0.0 || <2.0.0"}]})
-        )
-        .is_err());
+        assert!(decl_from_initialize("x", &json!({"provides": [7], "requires": []})).is_err());
+        assert!(
+            decl_from_initialize(
+                "x",
+                &json!({"provides": [], "requires": [{"optional": true}]})
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn builds_the_table_and_reports_an_unprovided_slot() {
-        let decls = vec![decl("provider", &[("demo.text", "1.0.0")], &[])];
-        let report = check(&decls, &slots(&[("demo.text", "provider"), ("demo.web", "provider")]));
-        assert_eq!(report.table["demo.text"].version, "1.0.0");
+        let decls = vec![decl("provider", &["demo.text"], &[])];
+        let report = check(
+            &decls,
+            &slots(&[("demo.text", "provider"), ("demo.web", "provider")]),
+        );
+        assert_eq!(report.table["demo.text"].plugin, "provider");
         assert_eq!(report.errors.len(), 1, "{report:?}");
-        assert!(report.errors[0].message.contains("does not provide `demo.web`"));
-        assert_eq!(report.errors[0].field.as_deref(), Some("capability.demo.web"));
+        assert!(
+            report.errors[0]
+                .message
+                .contains("does not provide `demo.web`")
+        );
+        assert_eq!(
+            report.errors[0].field.as_deref(),
+            Some("capability.demo.web")
+        );
     }
 
     #[test]
     fn a_required_dependency_nobody_serves_leaves_the_consumer_waiting() {
         let decls = vec![decl(
             "consumer",
-            &[("demo.loop", "1.0.0")],
-            &[("demo.text", "^1", false), ("demo.tools", "^1", true)],
+            &["demo.loop"],
+            &[("demo.text", false), ("demo.tools", true)],
         )];
         let report = check(&decls, &slots(&[("demo.loop", "consumer")]));
         assert!(report.errors.is_empty(), "{report:?}");
-        assert_eq!(report.blocked["consumer"], vec!["demo.text".to_string()], "{report:?}");
+        assert_eq!(
+            report.blocked["consumer"],
+            vec!["demo.text".to_string()],
+            "{report:?}"
+        );
         assert!(report.table.is_empty(), "{report:?}");
         assert!(
             report
@@ -559,7 +556,10 @@ mod tests {
             "{report:?}"
         );
         assert!(
-            report.warnings.iter().any(|w| w.message.contains("is blocked; the pin has no effect")),
+            report
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("is blocked; the pin has no effect")),
             "{report:?}"
         );
     }
@@ -567,10 +567,13 @@ mod tests {
     #[test]
     fn blocking_cascades_along_the_dependency_chain() {
         let decls = vec![
-            decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^1", false)]),
-            decl("provider", &[("demo.text", "1.0.0")], &[("demo.store", "^1", false)]),
+            decl("consumer", &["demo.loop"], &[("demo.text", false)]),
+            decl("provider", &["demo.text"], &[("demo.store", false)]),
         ];
-        let report = check(&decls, &slots(&[("demo.loop", "consumer"), ("demo.text", "provider")]));
+        let report = check(
+            &decls,
+            &slots(&[("demo.loop", "consumer"), ("demo.text", "provider")]),
+        );
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.blocked.len(), 2, "{report:?}");
         assert_eq!(report.blocked["provider"], vec!["demo.store".to_string()]);
@@ -579,59 +582,46 @@ mod tests {
     }
 
     #[test]
-    fn version_mismatch_leaves_the_consumer_waiting_and_warns_when_optional() {
-        let decls = vec![
-            decl("provider", &[("demo.text", "1.0.0")], &[]),
-            decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^2", false)]),
-        ];
-        let report = check(
-            &decls,
-            &slots(&[("demo.loop", "consumer"), ("demo.text", "provider")]),
-        );
+    fn an_optional_dependency_nobody_serves_is_skipped_and_warns() {
+        let decls = vec![decl("consumer", &["demo.loop"], &[("demo.text", true)])];
+        let report = check(&decls, &slots(&[("demo.loop", "consumer")]));
         assert!(report.errors.is_empty(), "{report:?}");
-        assert_eq!(report.blocked["consumer"], vec!["demo.text".to_string()], "{report:?}");
+        assert!(report.blocked.is_empty(), "{report:?}");
+        assert!(report.table.contains_key("demo.loop"), "{report:?}");
         assert!(
             report
                 .warnings
                 .iter()
-                .any(|w| w.message.contains("provides `demo.text` 1.0.0")),
-            "{report:?}"
-        );
-
-        let optional = vec![
-            decl("provider", &[("demo.text", "1.0.0")], &[]),
-            decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^2", true)]),
-        ];
-        let report = check(
-            &optional,
-            &slots(&[("demo.loop", "consumer"), ("demo.text", "provider")]),
-        );
-        assert!(report.errors.is_empty(), "{report:?}");
-        assert!(report.blocked.is_empty(), "{report:?}");
-        assert!(
-            report.warnings.iter().any(|w| w.message.contains("optional dependency skipped")),
+                .any(|w| w.message.contains("optional dependency skipped")),
             "{report:?}"
         );
     }
 
     #[test]
     fn suggests_a_close_capability_name() {
-        let decls = vec![decl("store-provider", &[("demo.store", "1.0.0")], &[])];
+        let decls = vec![decl("store-provider", &["demo.store"], &[])];
         let report = check(&decls, &slots(&[("demo.store", "store-provider")]));
         assert!(report.errors.is_empty(), "{report:?}");
 
         let decls = vec![
-            decl("store-provider", &[("demo.store", "1.0.0")], &[]),
-            decl("consumer", &[("demo.loop", "1.0.0")], &[("demoo.store", "^1", false)]),
+            decl("store-provider", &["demo.store"], &[]),
+            decl("consumer", &["demo.loop"], &[("demoo.store", false)]),
         ];
         let report = check(
             &decls,
             &slots(&[("demo.store", "store-provider"), ("demo.loop", "consumer")]),
         );
         assert!(report.errors.is_empty(), "{report:?}");
-        assert_eq!(report.blocked["consumer"], vec!["demoo.store".to_string()], "{report:?}");
+        assert_eq!(
+            report.blocked["consumer"],
+            vec!["demoo.store".to_string()],
+            "{report:?}"
+        );
         assert!(
-            report.warnings.iter().any(|w| w.message.contains("did you mean `demo.store`?")),
+            report
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("did you mean `demo.store`?")),
             "{report:?}"
         );
     }
@@ -639,16 +629,13 @@ mod tests {
     #[test]
     fn orders_providers_before_consumers_and_breaks_ties_by_id() {
         let decls = vec![
-            decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^1", false)]),
-            decl("provider", &[("demo.text", "1.0.0")], &[]),
-            decl("subscriber", &[], &[("demo.loop", "^1", false)]),
+            decl("consumer", &["demo.loop"], &[("demo.text", false)]),
+            decl("provider", &["demo.text"], &[]),
+            decl("subscriber", &[], &[("demo.loop", false)]),
         ];
         let report = check(
             &decls,
-            &slots(&[
-                ("demo.loop", "consumer"),
-                ("demo.text", "provider"),
-            ]),
+            &slots(&[("demo.loop", "consumer"), ("demo.text", "provider")]),
         );
         assert!(report.errors.is_empty(), "{report:?}");
         let order = start_order(&decls, &report.table).unwrap();
@@ -658,8 +645,8 @@ mod tests {
     #[test]
     fn detects_a_cycle() {
         let decls = vec![
-            decl("a", &[("cap.a", "1.0.0")], &[("cap.b", "^1", false)]),
-            decl("b", &[("cap.b", "1.0.0")], &[("cap.a", "^1", false)]),
+            decl("a", &["cap.a"], &[("cap.b", false)]),
+            decl("b", &["cap.b"], &[("cap.a", false)]),
         ];
         let report = check(&decls, &slots(&[("cap.a", "a"), ("cap.b", "b")]));
         assert!(report.errors.is_empty(), "{report:?}");
@@ -670,7 +657,7 @@ mod tests {
 
     #[test]
     fn a_plugin_may_require_what_it_provides() {
-        let decls = vec![decl("solo", &[("cap.x", "1.0.0")], &[("cap.x", "^1", false)])];
+        let decls = vec![decl("solo", &["cap.x"], &[("cap.x", false)])];
         let report = check(&decls, &slots(&[("cap.x", "solo")]));
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(start_order(&decls, &report.table).unwrap(), vec!["solo"]);
@@ -679,28 +666,37 @@ mod tests {
     #[test]
     fn derives_routes_from_provides_without_any_capability_table() {
         let decls = vec![
-            decl("provider", &[("demo.text", "1.0.0")], &[]),
-            decl("consumer", &[("demo.loop", "1.0.0")], &[("demo.text", "^1", false)]),
+            decl("provider", &["demo.text"], &[]),
+            decl("consumer", &["demo.loop"], &[("demo.text", false)]),
         ];
         let report = check(&decls, &BTreeMap::new());
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.table["demo.text"].plugin, "provider");
         assert_eq!(report.table["demo.loop"].plugin, "consumer");
-        assert_eq!(start_order(&decls, &report.table).unwrap(), vec!["provider", "consumer"]);
+        assert_eq!(
+            start_order(&decls, &report.table).unwrap(),
+            vec!["provider", "consumer"]
+        );
     }
 
     #[test]
     fn two_providers_of_one_capability_need_a_pin() {
         let decls = vec![
-            decl("a", &[("demo.text", "1.0.0")], &[]),
-            decl("b", &[("demo.text", "1.0.0")], &[]),
+            decl("a", &["demo.text"], &[]),
+            decl("b", &["demo.text"], &[]),
         ];
         let report = check(&decls, &BTreeMap::new());
         assert_eq!(report.errors.len(), 1, "{report:?}");
         let message = &report.errors[0].message;
-        assert!(message.contains("`a`") && message.contains("`b`"), "{message}");
+        assert!(
+            message.contains("`a`") && message.contains("`b`"),
+            "{message}"
+        );
         assert!(message.contains("capability.\"demo.text\""), "{message}");
-        assert_eq!(report.errors[0].field.as_deref(), Some("capability.demo.text"));
+        assert_eq!(
+            report.errors[0].field.as_deref(),
+            Some("capability.demo.text")
+        );
 
         let pinned = check(&decls, &slots(&[("demo.text", "b")]));
         assert!(pinned.errors.is_empty(), "{pinned:?}");
@@ -710,32 +706,30 @@ mod tests {
     #[test]
     fn a_pin_at_a_disabled_plugin_is_inert_and_warns() {
         let decls = vec![
-            decl("a", &[("demo.text", "1.0.0")], &[]),
-            decl("b", &[("demo.text", "2.0.0")], &[]),
+            decl("a", &["demo.text"], &[]),
+            decl("b", &["demo.text"], &[]),
         ];
         let report = check_off(&decls, &slots(&[("demo.text", "b")]), &["b"]);
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.table["demo.text"].plugin, "a");
         assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.message.contains("`b`, which is disabled; the pin has no effect")),
+            report.warnings.iter().any(|w| w
+                .message
+                .contains("`b`, which is disabled; the pin has no effect")),
             "{report:?}"
         );
     }
 
     #[test]
     fn a_pin_at_an_unconfigured_id_is_inert_and_warns() {
-        let decls = vec![decl("a", &[("demo.text", "1.0.0")], &[])];
+        let decls = vec![decl("a", &["demo.text"], &[])];
         let report = check_off(&decls, &slots(&[("demo.text", "typo")]), &[]);
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.table["demo.text"].plugin, "a");
         assert!(
-            report
-                .warnings
-                .iter()
-                .any(|w| w.message.contains("`typo`, which is not configured; the pin has no effect")),
+            report.warnings.iter().any(|w| w
+                .message
+                .contains("`typo`, which is not configured; the pin has no effect")),
             "{report:?}"
         );
     }
@@ -743,29 +737,33 @@ mod tests {
     #[test]
     fn a_pin_that_goes_inert_leaves_an_ambiguous_slot_an_error() {
         let decls = vec![
-            decl("a", &[("demo.text", "1.0.0")], &[]),
-            decl("b", &[("demo.text", "1.0.0")], &[]),
+            decl("a", &["demo.text"], &[]),
+            decl("b", &["demo.text"], &[]),
         ];
         let report = check(&decls, &slots(&[("demo.text", "typo")]));
         assert_eq!(report.errors.len(), 1, "{report:?}");
-        assert!(report.errors[0].message.contains("add capability"), "{report:?}");
+        assert!(
+            report.errors[0].message.contains("add capability"),
+            "{report:?}"
+        );
         assert!(report.table.is_empty(), "{report:?}");
     }
 
     #[test]
     fn a_pin_at_a_waiting_plugin_is_inert_and_warns() {
         let decls = vec![
-            decl("a", &[("demo.text", "1.0.0")], &[]),
-            decl("b", &[("demo.text", "2.0.0")], &[("demo.store", "^1", false)]),
+            decl("a", &["demo.text"], &[]),
+            decl("b", &["demo.text"], &[("demo.store", false)]),
         ];
         let report = check(&decls, &slots(&[("demo.text", "b")]));
         assert!(report.errors.is_empty(), "{report:?}");
         assert_eq!(report.blocked["b"], vec!["demo.store".to_string()]);
         assert_eq!(report.table["demo.text"].plugin, "a");
         assert!(
-            report.warnings.iter().any(|w| w.message.contains("`b`, which is blocked; the pin has no effect")),
+            report.warnings.iter().any(|w| w
+                .message
+                .contains("`b`, which is blocked; the pin has no effect")),
             "{report:?}"
         );
     }
 }
-

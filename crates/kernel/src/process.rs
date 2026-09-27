@@ -5,16 +5,16 @@
 //! forwards stderr into the kernel log.
 
 use std::process::Stdio;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 use protocol as proto;
-use protocol::{codes, Incoming, RpcError};
+use protocol::{Incoming, RpcError, codes};
 
 use loader::{Limits, PluginSpec};
 use logger as log;
@@ -40,7 +40,10 @@ impl Sink {
     /// A sink that goes nowhere, used before a process exists.
     pub fn closed() -> Sink {
         let (tx, _rx) = mpsc::unbounded_channel();
-        Sink { tx, bytes: Arc::new(AtomicUsize::new(0)) }
+        Sink {
+            tx,
+            bytes: Arc::new(AtomicUsize::new(0)),
+        }
     }
 
     pub fn queued_bytes(&self) -> usize {
@@ -211,8 +214,15 @@ pub fn spawn(id: &str, spec: &PluginSpec, limits: &Limits) -> std::io::Result<(P
     }
 
     Ok((
-        Process { child: Some(child), pid, sink: Sink { tx, bytes } },
-        Frames { rx: frame_rx, closed: closed_rx },
+        Process {
+            child: Some(child),
+            pid,
+            sink: Sink { tx, bytes },
+        },
+        Frames {
+            rx: frame_rx,
+            closed: closed_rx,
+        },
     ))
 }
 
@@ -259,8 +269,18 @@ mod tests {
         let mut both = encode(&frame);
         both.extend_from_slice(&encode(&proto::success(json!(3), json!({}))));
         let mut reader = BufReader::new(both.as_slice());
-        assert!(proto::read_frame(&mut reader, 1024).await.unwrap().is_some());
-        assert!(proto::read_frame(&mut reader, 1024).await.unwrap().is_some());
+        assert!(
+            proto::read_frame(&mut reader, 1024)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            proto::read_frame(&mut reader, 1024)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -273,6 +293,3 @@ mod tests {
         assert!(matches!(err, proto::FrameError::TooLarge(_)));
     }
 }
-
-
-

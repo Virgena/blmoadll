@@ -64,7 +64,8 @@ where
         }
     }
 
-    let len = content_length.ok_or_else(|| FrameError::BadHeader("missing Content-Length".into()))?;
+    let len =
+        content_length.ok_or_else(|| FrameError::BadHeader("missing Content-Length".into()))?;
     if len > max_frame_bytes {
         return Err(FrameError::TooLarge(len));
     }
@@ -120,7 +121,9 @@ fn content_length_of(line: &[u8]) -> Result<Option<usize>, FrameError> {
     if name != "content-length" {
         return Ok(None);
     }
-    let value = String::from_utf8_lossy(&line[colon + 1..]).trim().to_string();
+    let value = String::from_utf8_lossy(&line[colon + 1..])
+        .trim()
+        .to_string();
     let len = value
         .parse::<usize>()
         .map_err(|_| FrameError::BadHeader(format!("bad Content-Length: {value:?}")))?;
@@ -184,5 +187,3 @@ mod tests {
         assert!(read_frame(&mut reader, 64).await.unwrap().is_none());
     }
 }
-
-

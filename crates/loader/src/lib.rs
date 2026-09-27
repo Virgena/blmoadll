@@ -14,5 +14,5 @@ pub mod spec;
 
 pub use config::{Config, ConfigError};
 pub use graph::{Decl, Issue, Req};
-pub use route::{to_json, Route, RoutingTable};
+pub use route::{Route, RoutingTable, to_json};
 pub use spec::{Limits, PluginSpec, Timeouts};

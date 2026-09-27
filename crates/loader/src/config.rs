@@ -43,11 +43,17 @@ pub struct ConfigError {
 
 impl ConfigError {
     pub fn new(message: impl Into<String>) -> Self {
-        ConfigError { message: message.into(), field: None }
+        ConfigError {
+            message: message.into(),
+            field: None,
+        }
     }
 
     pub fn at(field: &str, message: impl Into<String>) -> Self {
-        ConfigError { message: message.into(), field: Some(field.to_string()) }
+        ConfigError {
+            message: message.into(),
+            field: Some(field.to_string()),
+        }
     }
 }
 
@@ -201,10 +207,10 @@ impl Config {
             )));
         }
         if plugins.is_empty() {
-            return Err(ConfigError::new("no enabled [plugins.<id>] entries configured"));
+            return Err(ConfigError::new(
+                "no enabled [plugins.<id>] entries configured",
+            ));
         }
-
-
 
         if plugins.contains_key(protocol::HOST) {
             return Err(ConfigError::at(
@@ -229,7 +235,9 @@ impl Config {
     /// file contents around. `0` means nothing could be read, which never
     /// equals a real change.
     pub fn fingerprint(path: &Path) -> u64 {
-        let Ok(layers) = read_layers(path) else { return 0 };
+        let Ok(layers) = read_layers(path) else {
+            return 0;
+        };
         let mut joined = String::new();
         for layer in layers {
             joined.push_str(&layer.path.to_string_lossy());
@@ -313,7 +321,11 @@ fn walk(
             walk(&resolve_from(&dir, target), out, seen)?;
         }
     }
-    out.push(Layer { path: path.to_path_buf(), text, table });
+    out.push(Layer {
+        path: path.to_path_buf(),
+        text,
+        table,
+    });
     Ok(())
 }
 
@@ -360,16 +372,18 @@ impl RawPlugin {
                 return Err(ConfigError::at(
                     &format!("{base}.name"),
                     "name and command are alternatives: a row that names a package runs through node",
-                ))
+                ));
             }
             (Some(name), None) => {
                 let name = expand(name, &format!("{base}.name"), env)?;
                 if name.trim().is_empty() {
-                    return Err(ConfigError::at(&format!("{base}.name"), "name must not be empty"));
+                    return Err(ConfigError::at(
+                        &format!("{base}.name"),
+                        "name must not be empty",
+                    ));
                 }
-                let entry = resolve_package(&name, dir).map_err(|message| {
-                    ConfigError::at(&format!("{base}.name"), message)
-                })?;
+                let entry = resolve_package(&name, dir)
+                    .map_err(|message| ConfigError::at(&format!("{base}.name"), message))?;
                 let mut args = Vec::with_capacity(self.args.len() + 1);
                 args.push(entry.to_string_lossy().into_owned());
                 for (index, arg) in self.args.iter().enumerate() {
@@ -379,7 +393,10 @@ impl RawPlugin {
             }
             (None, Some(command)) => {
                 if command.trim().is_empty() {
-                    return Err(ConfigError::at(&format!("{base}.command"), "command must not be empty"));
+                    return Err(ConfigError::at(
+                        &format!("{base}.command"),
+                        "command must not be empty",
+                    ));
                 }
                 let command = expand(command, &format!("{base}.command"), env)?;
                 let mut args = Vec::with_capacity(self.args.len());
@@ -392,7 +409,7 @@ impl RawPlugin {
                 return Err(ConfigError::at(
                     &base,
                     "a row names either a package or a command",
-                ))
+                ));
             }
         };
         let cwd = match &self.cwd {
@@ -401,7 +418,10 @@ impl RawPlugin {
         };
         let mut expanded = BTreeMap::new();
         for (key, value) in &self.env {
-            expanded.insert(key.clone(), expand(value, &format!("{base}.env.{key}"), env)?);
+            expanded.insert(
+                key.clone(),
+                expand(value, &format!("{base}.env.{key}"), env)?,
+            );
         }
         Ok(PluginSpec {
             id: id.to_string(),
@@ -437,13 +457,16 @@ fn resolve_package(name: &str, dir: &Path) -> Result<PathBuf, String> {
     }
     let mut package = None;
     for ancestor in dir.ancestors() {
-        let candidate = ancestor.join("node_modules").join(name.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let candidate = ancestor
+            .join("node_modules")
+            .join(name.replace('/', std::path::MAIN_SEPARATOR_STR));
         if candidate.join("package.json").is_file() {
             package = Some(candidate);
             break;
         }
     }
-    let package = package.ok_or_else(|| format!("{name} is not installed at or above {}", dir.display()))?;
+    let package =
+        package.ok_or_else(|| format!("{name} is not installed at or above {}", dir.display()))?;
     let manifest = std::fs::read_to_string(package.join("package.json"))
         .map_err(|e| format!("cannot read {name}'s package.json: {e}"))?;
     let parsed: Value = serde_json::from_str(&manifest)
@@ -535,7 +558,7 @@ pub fn expand(
                         return Err(ConfigError::at(
                             field,
                             format!("environment variable {name} is not set"),
-                        ))
+                        ));
                     }
                 }
             }
@@ -605,7 +628,10 @@ prefix = "echo: "
         let config = sample(&env);
         let plugin = &config.plugins["provider"];
         assert_eq!(plugin.cwd, config.dir.join("sub"));
-        assert_eq!(plugin.command, config.dir.join("../target/debug/eggshell-plugin-example"));
+        assert_eq!(
+            plugin.command,
+            config.dir.join("../target/debug/eggshell-plugin-example")
+        );
 
         let bare = Config::parse(
             "[plugins.p]\ncommand = \"my-plugin\"\n[capability]\n",
@@ -642,10 +668,18 @@ prefix = "echo: "
         let err =
             Config::parse("[plugins.p]\n[capability]\n", Path::new("c.toml"), &env).unwrap_err();
         // A row with neither key is not a typo hunt: it names nothing to run.
-        assert!(err.message.contains("either a package or a command"), "{}", err.message);
+        assert!(
+            err.message.contains("either a package or a command"),
+            "{}",
+            err.message
+        );
 
         let err = Config::parse("", Path::new("c.toml"), &env).unwrap_err();
-        assert!(err.message.contains("no enabled [plugins"), "{}", err.message);
+        assert!(
+            err.message.contains("no enabled [plugins"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -657,8 +691,8 @@ prefix = "echo: "
     /// Somewhere to put real files: layering is a filesystem feature, so it is
     /// tested through files rather than through `parse`.
     fn scratch(name: &str) -> PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("eggshell-config-{name}-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("eggshell-config-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
@@ -701,7 +735,10 @@ model = "good"
         assert_eq!(api.config["model"], Value::from("good"));
         // The keys the layer did not mention survive from below, on both
         // sides of the merge: a nested table and the row that owns it.
-        assert_eq!(api.config["base_url"], Value::from("https://example.invalid"));
+        assert_eq!(
+            api.config["base_url"],
+            Value::from("https://example.invalid")
+        );
         assert_eq!(api.args, vec!["api.ts".to_string()]);
         assert_eq!(config.limits.request_timeout_ms, 1234);
         // Base first, entry last: the order the report prints.
@@ -738,7 +775,10 @@ command = "node"
     #[test]
     fn arrays_are_replaced_whole_rather_than_joined() {
         let dir = scratch("arrays");
-        write(&dir.join("base.toml"), "[plugins.p]\ncommand = \"node\"\nargs = [\"a\", \"b\"]\n");
+        write(
+            &dir.join("base.toml"),
+            "[plugins.p]\ncommand = \"node\"\nargs = [\"a\", \"b\"]\n",
+        );
         let local = write(
             &dir.join("local.toml"),
             "extends = [\"base.toml\"]\n[plugins.p]\nargs = [\"c\"]\n",
@@ -758,7 +798,10 @@ command = "node"
         );
 
         let config = Config::load(&local, &env_of(&[])).unwrap();
-        assert_eq!(config.plugins.keys().collect::<Vec<_>>(), vec!["extra", "p"]);
+        assert_eq!(
+            config.plugins.keys().collect::<Vec<_>>(),
+            vec!["extra", "p"]
+        );
         // A layer is relative to the file that names it, not to the entry.
         assert_eq!(config.dir, dir);
     }
@@ -769,13 +812,25 @@ command = "node"
         // a extends b and c, b extends c, and c extends a: both a diamond and
         // a cycle, which must terminate with each file in first-read order.
         let row = |id: &str| format!("[plugins.{id}]\ncommand = \"node\"\n");
-        let a = write(&dir.join("a.toml"), &format!("extends = [\"b.toml\", \"c.toml\"]\n{}", row("a")));
-        let b = write(&dir.join("b.toml"), &format!("extends = [\"c.toml\"]\n{}", row("b")));
-        let c = write(&dir.join("c.toml"), &format!("extends = [\"a.toml\"]\n{}", row("c")));
+        let a = write(
+            &dir.join("a.toml"),
+            &format!("extends = [\"b.toml\", \"c.toml\"]\n{}", row("a")),
+        );
+        let b = write(
+            &dir.join("b.toml"),
+            &format!("extends = [\"c.toml\"]\n{}", row("b")),
+        );
+        let c = write(
+            &dir.join("c.toml"),
+            &format!("extends = [\"a.toml\"]\n{}", row("c")),
+        );
 
         let config = Config::load(&a, &env_of(&[])).unwrap();
         assert_eq!(config.sources, vec![c, b, a]);
-        assert_eq!(config.plugins.keys().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(
+            config.plugins.keys().collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
     }
 
     #[test]
@@ -801,7 +856,9 @@ command = "node"
 
     /// Put a package where Node would look for it: `dir/node_modules/<name>`.
     fn install(dir: &Path, package: &str, manifest: &str, files: &[(&str, &str)]) -> PathBuf {
-        let root = dir.join("node_modules").join(package.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let root = dir
+            .join("node_modules")
+            .join(package.replace('/', std::path::MAIN_SEPARATOR_STR));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("package.json"), manifest).unwrap();
         for (rel, body) in files {
@@ -833,7 +890,10 @@ command = "node"
         let config = Config::load(&path, &env_of(&[])).unwrap();
         let row = &config.plugins["thing"];
         assert_eq!(row.command, PathBuf::from("node"));
-        assert_eq!(row.args[0], installed.join("lib").join("index.js").to_string_lossy());
+        assert_eq!(
+            row.args[0],
+            installed.join("lib").join("index.js").to_string_lossy()
+        );
         assert_eq!(row.args[1], "--flag");
         assert_eq!(row.cwd, dir);
     }
@@ -849,7 +909,10 @@ command = "node"
         );
         let nested = dir.join("profiles").join("default");
         std::fs::create_dir_all(&nested).unwrap();
-        let path = write(&nested.join("eggshell.toml"), "[plugins.p]\nname = \"plain\"\n");
+        let path = write(
+            &nested.join("eggshell.toml"),
+            "[plugins.p]\nname = \"plain\"\n",
+        );
 
         let config = Config::load(&path, &env_of(&[])).unwrap();
         assert_eq!(
@@ -864,12 +927,18 @@ command = "node"
     fn a_package_row_reports_a_missing_package_and_a_missing_entry() {
         let dir = scratch("package-missing");
         install(&dir, "hollow", r#"{ "name": "hollow" }"#, &[]);
-        let absent = write(&dir.join("absent.toml"), "[plugins.gone]\nname = \"ghost\"\n");
+        let absent = write(
+            &dir.join("absent.toml"),
+            "[plugins.gone]\nname = \"ghost\"\n",
+        );
         let err = Config::load(&absent, &env_of(&[])).unwrap_err();
         assert_eq!(err.field.unwrap(), "plugins.gone.name");
         assert!(err.message.contains("ghost"), "{}", err.message);
 
-        let empty = write(&dir.join("empty.toml"), "[plugins.hollow]\nname = \"hollow\"\n");
+        let empty = write(
+            &dir.join("empty.toml"),
+            "[plugins.hollow]\nname = \"hollow\"\n",
+        );
         let err = Config::load(&empty, &env_of(&[])).unwrap_err();
         assert_eq!(err.field.unwrap(), "plugins.hollow.name");
         assert!(err.message.contains("index.js"), "{}", err.message);
@@ -878,7 +947,12 @@ command = "node"
     #[test]
     fn a_row_needs_exactly_one_of_name_and_command() {
         let dir = scratch("package-exclusive");
-        install(&dir, "both", r#"{ "name": "both", "main": "index.js" }"#, &[("index.js", "//\n")]);
+        install(
+            &dir,
+            "both",
+            r#"{ "name": "both", "main": "index.js" }"#,
+            &[("index.js", "//\n")],
+        );
 
         let mixed = write(
             &dir.join("mixed.toml"),
@@ -891,7 +965,11 @@ command = "node"
         let neither = write(&dir.join("neither.toml"), "[plugins.p]\nargs = []\n");
         let err = Config::load(&neither, &env_of(&[])).unwrap_err();
         assert_eq!(err.field.unwrap(), "plugins.p");
-        assert!(err.message.contains("either a package or a command"), "{}", err.message);
+        assert!(
+            err.message.contains("either a package or a command"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

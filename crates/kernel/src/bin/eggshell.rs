@@ -22,14 +22,17 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use kernel::{Host, Kernel};
 use loader::Config;
 use logger as log;
-use protocol::{codes, failure, method, parse_frame, read_frame, reason, success, trigger, write_frame, Incoming, RpcError};
+use protocol::{
+    Incoming, RpcError, codes, failure, method, parse_frame, read_frame, reason, success, trigger,
+    write_frame,
+};
 
 /// Frame cap for the host pipe. The plugin pipes keep their own
 /// `max_frame_bytes`; this is the host's limit.
@@ -151,12 +154,19 @@ async fn read_host(kernel: Arc<Kernel>, out: mpsc::Sender<Value>) {
     loop {
         match read_frame(&mut reader, MAX_FRAME_BYTES).await {
             Ok(Some(payload)) => match parse_frame(&payload) {
-                Ok(Incoming::Request { id, method: name, params }) => {
+                Ok(Incoming::Request {
+                    id,
+                    method: name,
+                    params,
+                }) => {
                     let kernel = Arc::clone(&kernel);
                     let out = out.clone();
                     tokio::spawn(async move { answer(&kernel, &out, id, &name, params).await });
                 }
-                Ok(Incoming::Notification { method: name, params }) => {
+                Ok(Incoming::Notification {
+                    method: name,
+                    params,
+                }) => {
                     if name == method::CANCEL {
                         // The host gives up a stream (or a call): the kernel stops
                         // forwarding and tells the provider. Cancelling is
@@ -164,15 +174,24 @@ async fn read_host(kernel: Arc<Kernel>, out: mpsc::Sender<Value>) {
                         // back, because the caller is the one who asked.
                         kernel.cancel(&params);
                     } else {
-                        log::warn("kernel", &format!("host sent a notification the kernel does not take: {name}"));
+                        log::warn(
+                            "kernel",
+                            &format!("host sent a notification the kernel does not take: {name}"),
+                        );
                     }
                 }
                 Ok(Incoming::Response { .. }) | Ok(Incoming::ErrorResponse { .. }) => {
-                    log::warn("kernel", "host sent a response; the kernel never calls the host");
+                    log::warn(
+                        "kernel",
+                        "host sent a response; the kernel never calls the host",
+                    );
                 }
                 Err(error) => log::warn(
                     "kernel",
-                    &format!("host sent an unparsable frame ({})", codes::name(error.code)),
+                    &format!(
+                        "host sent an unparsable frame ({})",
+                        codes::name(error.code)
+                    ),
                 ),
             },
             Ok(None) => break,
@@ -190,7 +209,13 @@ async fn read_host(kernel: Arc<Kernel>, out: mpsc::Sender<Value>) {
 
 /// Answers one host request. `shutdown` is the exception: it replies before it
 /// acts, because the host is waiting on that very reply.
-async fn answer(kernel: &Arc<Kernel>, out: &mpsc::Sender<Value>, id: Value, name: &str, params: Value) {
+async fn answer(
+    kernel: &Arc<Kernel>,
+    out: &mpsc::Sender<Value>,
+    id: Value,
+    name: &str,
+    params: Value,
+) {
     let reply = match name {
         "invoke" => {
             let capability = str_field(&params, "capability");
@@ -214,7 +239,10 @@ async fn answer(kernel: &Arc<Kernel>, out: &mpsc::Sender<Value>, id: Value, name
         "capabilities" => success(id, kernel.capabilities()),
         "subscribe" => {
             let patterns = string_list(&params, "patterns");
-            let replay = params.get("replay").and_then(Value::as_bool).unwrap_or(false);
+            let replay = params
+                .get("replay")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             match kernel.subscribe(&patterns, replay) {
                 Ok(subscription_id) => success(id, json!({ "subscription_id": subscription_id })),
                 Err(error) => failure(id, &error),
@@ -257,7 +285,9 @@ async fn answer(kernel: &Arc<Kernel>, out: &mpsc::Sender<Value>, id: Value, name
                 Some(other) => {
                     let error = RpcError::new(
                         codes::INVALID_PARAMS,
-                        format!("shutdown reason must be \"ui_quit\" or \"kernel_exit\", not \"{other}\""),
+                        format!(
+                            "shutdown reason must be \"ui_quit\" or \"kernel_exit\", not \"{other}\""
+                        ),
                     );
                     let _ = out.send(failure(id, &error)).await;
                     return;
@@ -297,7 +327,10 @@ async fn write_frames(mut queue: mpsc::Receiver<Value>) {
         let body = match serde_json::to_vec(&frame) {
             Ok(body) => body,
             Err(error) => {
-                log::warn("kernel", &format!("cannot encode a frame for the host: {error}"));
+                log::warn(
+                    "kernel",
+                    &format!("cannot encode a frame for the host: {error}"),
+                );
                 continue;
             }
         };
@@ -309,13 +342,22 @@ async fn write_frames(mut queue: mpsc::Receiver<Value>) {
 }
 
 fn str_field(params: &Value, key: &str) -> String {
-    params.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn string_list(params: &Value, key: &str) -> Vec<String> {
     params
         .get(key)
         .and_then(Value::as_array)
-        .map(|list| list.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }

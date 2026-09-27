@@ -2,7 +2,7 @@
 
 This document is for people who write plugins, especially plugins in TypeScript. After reading it you can write a plugin that loads, answers calls, streams, exchanges events, reads and writes the terminal, and shuts down cleanly, without reading any Rust. The other side, a host that runs the kernel as a child process and writes no plugins, is section 14.
 
-What the kernel knows: capability ids, semantic versions, and which process to talk to. It does not know what a model, a session, a tool or a UI is, and it does not care what language your plugin is written in. The only interface is the framing below.
+What the kernel knows: capability ids and which process serves one. It does not know what a model, a session, a tool or a UI is, and it does not care what language your plugin is written in. The only interface is the framing below.
 
 Conventions: "must" marks something the kernel enforces; "should" marks something the kernel does not check but that still misbehaves when you get it wrong (timeouts, orphaned chunks).
 
@@ -141,7 +141,7 @@ The kernel sends it as soon as the process is up. params:
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "plugin_id": "provider",
   "kernel_version": "0.1.0",
   "config": {"prefix": "echo: "}
@@ -150,7 +150,7 @@ The kernel sends it as soon as the process is up. params:
 
 | field | meaning |
 |---|---|
-| `protocol` | the kernel's protocol version, currently 1 |
+| `protocol` | the kernel's protocol version, currently 2 |
 | `plugin_id` | the id you have in the config file |
 | `kernel_version` | the version string of the kernel crate, for logs and diagnostics only |
 | `config` | the verbatim JSON of the `[plugins.<id>.config]` table in the config file; `{}` when absent |
@@ -165,33 +165,30 @@ result must contain:
 
 ```json
 {
-  "protocol": 1,
-  "provides": [{"capability": "demo.text", "version": "1.0.0"}],
-  "requires": [{"capability": "demo.tools", "version": "^1", "optional": true}]
+  "protocol": 2,
+  "provides": ["demo.text"],
+  "requires": [{"capability": "demo.tools", "optional": true}]
 }
 ```
 
 | field | required | notes |
 |---|---|---|
-| `protocol` | yes | must equal 1. Anything else is -32015, the kernel startup fails, and it says "you claim protocol N, the kernel says 1" |
-| `provides` | yes | array. Every entry needs `capability` and `version` |
-| `requires` | yes | array. Every entry needs `capability` and `version`; `optional` defaults to false |
+| `protocol` | yes | must equal 2. Anything else is -32015, the kernel startup fails, and it says "you claim protocol N, the kernel says 2" |
+| `provides` | yes | array of capability ids (strings) |
+| `requires` | yes | array of objects. Every entry needs `capability`; `optional` defaults to false |
 
-- `provides[].version` must be a **complete semver** (`1.0.0`), because the kernel uses it to satisfy other plugins' ranges.
-- `requires[].version` must be a **semver range** (`^1`, `>=1.2, <2`).
-- An invalid version string is a startup error, not a warning.
 - Missing either `provides` or `requires` is an error (the messages are "initialize reply has no `provides` array" / "no `requires` array").
-- A `optional: true` dependency with no provider only logs a warning and is skipped (it does not block startup); a required dependency that is missing, whose version does not match, or that forms a cycle fails startup.
+- A `optional: true` dependency with no provider only logs a warning and is skipped (it does not block startup); a required dependency that is missing or that forms a cycle fails startup.
 - Other fields in result are ignored. The kernel builds the routing table and the topological order from `provides` / `requires` alone.
 
-The dependency semantics are worth stating plainly: `requires` says "I need another capability to exist at a matching version". It decides **startup order** (your start is called after the start of what you depend on) and does not prevent you from calling any capability at runtime; runtime calls are bounded by the routing table only.
+The dependency semantics are worth stating plainly: `requires` says "I need another capability to exist". It decides **startup order** (your start is called after the start of what you depend on) and does not prevent you from calling any capability at runtime; runtime calls are bounded by the routing table only.
 
 ### 3.2 start (request, must be answered)
 
 Called in topological order once every dependency is ready. params:
 
 ```json
-{"capabilities": {"demo.text": {"plugin": "provider", "version": "1.0.0"}}}
+{"capabilities": {"demo.text": {"plugin": "provider"}}}
 ```
 
 - This is a **snapshot of the whole routing table**, sorted by capability id. It is a starting point, not a promise: later changes arrive as `kernel.capabilities.changed` events.
@@ -461,7 +458,7 @@ So: after `shutdown` you have about 5 seconds. Flush to disk and close connectio
 
 ## 6. Capability calls and routing
 
-- A capability id is an **opaque string**. The kernel has no idea what `"demo.text"` means, only which plugin owns it and at what version. The names are an agreement between you and whoever writes the config.
+- A capability id is an **opaque string**. The kernel has no idea what `"demo.text"` means, only which plugin owns it. The names are an agreement between you and whoever writes the config.
 - The routing table is derived from the plugins' `provides`: whatever you declare in `initialize` automatically has a slot in the config, so there is nothing to copy into the config file. Declared means callable; to retire a capability, drop the plugin providing it from the config.
 - A plugin whose required capabilities nobody serves **does not start**. It is spawned and initialized, then held back in a waiting state: its `provides` are not in the table and its own capabilities answer -32010, until a reload brings a provider in (§8.6). Plugins that require what it provides wait in turn, and the kernel says who waits for what through `kernel.plugin.blocked` (§8.5). A plugin held back like that is still a plugin the kernel knows about: it keeps its process and its declaration, and it is started the moment the slot it waits for exists.
 - One provider per capability id. No priorities, no failover, no load balancing; to change providers, change the config (or hot reload).
@@ -712,7 +709,7 @@ The five standard JSON-RPC codes are reused verbatim; the rest are eggshellmod's
 | -32012 | `request_timeout` | the call timed out, or a stream went idle |
 | -32013 | `cancelled` | cancelled |
 | -32014 | `not_started` | the provider is alive but has not `start`ed |
-| -32015 | `protocol_version_mismatch` | the `protocol` in `initialize` is not 1 |
+| -32015 | `protocol_version_mismatch` | the `protocol` in `initialize` is not 2 |
 | -32016 | `frame_too_large` | the frame is past `max_frame_bytes` |
 | -32017 | `unknown_stream` | unknown stream id |
 | -32018 | `invalid_config` | a config or startup problem (a failed spawn, for instance) |
@@ -720,7 +717,7 @@ The five standard JSON-RPC codes are reused verbatim; the rest are eggshellmod's
 | -32020 | `payload_too_large` | the payload is past its ceiling (an event or `kernel.write`) |
 | -32021 | `unknown_subscription` | unknown subscription id |
 
--32602 shows up in these places: a `kernel.invoke` missing the string `meta.request_id`, an `initialize` reply missing `provides`/`requires`, a version string that is not valid semver, an empty subscription `patterns`, an io `stream` that is neither `stdin` nor `stdout`, a `kernel.write` whose `stream` is not `stdout`, an ill-formed `kernel.unsubscribe` id, a `kernel.publish` using the `kernel.` prefix, and a host `shutdown` whose `reason` is not one of the two allowed values.
+-32602 shows up in these places: a `kernel.invoke` missing the string `meta.request_id`, an `initialize` reply missing `provides`/`requires`, an empty subscription `patterns`, an io `stream` that is neither `stdin` nor `stdout`, a `kernel.write` whose `stream` is not `stdout`, an ill-formed `kernel.unsubscribe` id, a `kernel.publish` using the `kernel.` prefix, and a host `shutdown` whose `reason` is not one of the two allowed values.
 
 Three notes:
 
@@ -813,8 +810,8 @@ greeting = "hi"
 // An eggshell plugin written with Node: speaking the protocol is all it takes.
 import { writeSync } from "node:fs";
 
-const provides = [{ capability: "demo.text", version: "1.0.0" }];
-const requires: { capability: string; version: string; optional?: boolean }[] = [];
+const provides = ["demo.text"];
+const requires: { capability: string; optional?: boolean }[] = [];
 
 function send(message: unknown): void {
   const body = Buffer.from(JSON.stringify(message), "utf8");
@@ -856,7 +853,7 @@ function handle(message: any): void {
   switch (method) {
     case "initialize":
       send({ jsonrpc: "2.0", id,
-             result: { protocol: 1, provides, requires } });
+             result: { protocol: 2, provides, requires } });
       return;
 
     case "start":
@@ -944,7 +941,7 @@ extends = ["eggshell.base.toml", "team.toml"]   # loaded first, in this order
 
 ## 13. Version and compatibility
 
-- `PROTOCOL_VERSION` is currently 1.
+- `PROTOCOL_VERSION` is currently 2.
 - The version is negotiated through `initialize`'s `params.protocol` / `result.protocol`; a mismatch on either side is -32015, which fails startup and reports both versions explicitly.
 - Any incompatible wire change bumps it. **Adding an optional field is not incompatible** (the kernel ignores fields it does not know), while removing a field or changing its semantics is.
 - `kernel_version` is diagnostic only; do not gate features on it. Gate on `protocol`.
@@ -967,7 +964,7 @@ eggshell <config.toml> [--check] [--json]
 
 This executable is only produced by a `--features host` build. A default build produces no executables at all (apart from the test stand-in, see 12.2).
 
-`--check` is a config check: it starts every plugin, runs `initialize` once, validates the capability graph and version ranges, computes the startup order, prints a report and exits (0 = pass, 1 = at least one error). A `disabled` row and a plugin left waiting are warnings, so a config that only has those still exits 0: the report carries them as `disabled` (plugin ids) and `blocked` (`{plugin id: [capability id]}`), and the text form prints one `disabled: a, b` line and one `waiting: a needs c` line per waiting plugin. It **never sends `start`**, never touches io and emits no lifecycle events, so it needs no network and has no side effects. Run it after editing a config; it is much faster than a real conversation. The report goes to stdout (under check mode that fd is not a protocol pipe) with the same fields as the one written to stderr on a failed startup, and `--json` prints the same report as one line of JSON instead of text.
+`--check` is a config check: it starts every plugin, runs `initialize` once, validates the capability graph, computes the startup order, prints a report and exits (0 = pass, 1 = at least one error). A `disabled` row and a plugin left waiting are warnings, so a config that only has those still exits 0: the report carries them as `disabled` (plugin ids) and `blocked` (`{plugin id: [capability id]}`), and the text form prints one `disabled: a, b` line and one `waiting: a needs c` line per waiting plugin. It **never sends `start`**, never touches io and emits no lifecycle events, so it needs no network and has no side effects. Run it after editing a config; it is much faster than a real conversation. The report goes to stdout (under check mode that fd is not a protocol pipe) with the same fields as the one written to stderr on a failed startup, and `--json` prints the same report as one line of JSON instead of text.
 
 ```
 host -> kernel fd 0    frames the host sends (requests)
@@ -984,7 +981,7 @@ Exactly these six, anything else gets -32601:
 | method | params | result |
 |---|---|---|
 | `invoke` | `capability`, `method`, `params`, optional `meta.stream` | the provider's business result; `{stream_id}` when streaming |
-| `capabilities` | none | `{capability id: {plugin, version}}` |
+| `capabilities` | none | `{capability id: {plugin}}` |
 | `subscribe` | `patterns` (array of strings), optional `replay` (boolean, default false) | `{subscription_id}` |
 | `unsubscribe` | `subscription_id` | `{}` |
 | `shutdown` | optional `reason` | `{}`, and going down starts **after this frame is sent** |

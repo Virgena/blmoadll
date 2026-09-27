@@ -1,9 +1,9 @@
 //! The kernel: boot, route, relay, reload, shut down.
 //!
-//! It knows capability ids, semver ranges and which process to talk to. It does
-//! not know what a "model", a "session" or a "UI" is. The one place it exceeds
-//! that brief on purpose is `io`: multiplexing stdin/stdout is a transport job,
-//! and the docs say so out loud.
+//! It knows capability ids and which process serves one. It does not know what
+//! a "model", a "session" or a "UI" is. The one place it exceeds that brief on
+//! purpose is `io`: multiplexing stdin/stdout is a transport job, and the docs
+//! say so out loud.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -11,19 +11,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use protocol as proto;
-use protocol::{codes, method, HOST, Incoming, RpcError};
+use protocol::{HOST, Incoming, RpcError, codes, method};
 
-use loader::{Config, ConfigError, Limits, PluginSpec};
 use crate::events::{Budget, EventBus};
-use loader::graph::{self, Decl, Issue};
-use loader::{to_json, RoutingTable};
 use crate::io::{self, Stdout};
-use logger as log;
 use crate::process::{self, Frames};
+use loader::graph::{self, Decl, Issue};
+use loader::{Config, ConfigError, Limits, PluginSpec};
+use loader::{RoutingTable, to_json};
+use logger as log;
 
 /// Interval between polls of the shutdown flow, the sweeper and the reloader.
 const POLL: Duration = Duration::from_millis(20);
@@ -170,10 +170,18 @@ impl Report {
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         for error in &self.errors {
-            out.push_str(&format!("error [{}] {}\n", codes::name(error.code), error.message));
+            out.push_str(&format!(
+                "error [{}] {}\n",
+                codes::name(error.code),
+                error.message
+            ));
         }
         for warning in &self.warnings {
-            out.push_str(&format!("warning [{}] {}\n", codes::name(warning.code), warning.message));
+            out.push_str(&format!(
+                "warning [{}] {}\n",
+                codes::name(warning.code),
+                warning.message
+            ));
         }
         if !self.sources.is_empty() {
             out.push_str(&format!("config: {}\n", self.sources.join(" + ")));
@@ -193,9 +201,8 @@ impl Report {
         ));
         for (capability, route) in &self.capabilities {
             out.push_str(&format!(
-                "  {capability} = {} ({})\n",
-                route["plugin"].as_str().unwrap_or("?"),
-                route["version"].as_str().unwrap_or("?")
+                "  {capability} = {}\n",
+                route["plugin"].as_str().unwrap_or("?")
             ));
         }
         out
@@ -203,13 +210,20 @@ impl Report {
 }
 
 fn from_config_error(error: ConfigError) -> Issue {
-    Issue { code: codes::INVALID_CONFIG, message: error.message, field: error.field }
+    Issue {
+        code: codes::INVALID_CONFIG,
+        message: error.message,
+        field: error.field,
+    }
 }
 
 fn str_field(params: &Value, key: &str) -> String {
-    params.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
-
 
 /// Runs one whole kernel lifetime: boot, serve, shut down. Returns the report.
 pub async fn run(path: &Path, check: bool) -> Report {
@@ -255,13 +269,18 @@ impl Kernel {
     fn no_terminal(name: &str) -> RpcError {
         RpcError::new(
             codes::METHOD_NOT_FOUND,
-            format!("{name} is not available: the kernel runs as a host subprocess, so its terminal belongs to the host"),
+            format!(
+                "{name} is not available: the kernel runs as a host subprocess, so its terminal belongs to the host"
+            ),
         )
     }
 
     fn budget(&self) -> Budget {
         let kernel = self.cfg();
-        Budget { len: kernel.event_queue_len, bytes: kernel.event_queue_bytes }
+        Budget {
+            len: kernel.event_queue_len,
+            bytes: kernel.event_queue_bytes,
+        }
     }
 
     fn ids(&self) -> Vec<String> {
@@ -284,7 +303,6 @@ impl Kernel {
     fn touch(&self) {
         self.state.lock().unwrap().last_activity = Instant::now();
     }
-
 
     /// `-32011` when a capability's provider is known to be unusable.
     fn availability(&self, provider: &str) -> Option<RpcError> {
@@ -321,11 +339,9 @@ impl Kernel {
                 json!({
                     "id": id,
                     "command": instance.cfg.command.display().to_string(),
-                    "provides": instance.decl.provides.iter()
-                        .map(|(c, v)| json!({"capability": c, "version": v}))
-                        .collect::<Vec<_>>(),
+                    "provides": instance.decl.provides,
                     "requires": instance.decl.requires.iter()
-                        .map(|r| json!({"capability": r.capability, "version": r.version, "optional": r.optional}))
+                        .map(|r| json!({"capability": r.capability, "optional": r.optional}))
                         .collect::<Vec<_>>(),
                 })
             })
@@ -398,8 +414,11 @@ impl Kernel {
                 }
                 Err(error) => {
                     report.errors.push(
-                        Issue::error(error.code, format!("`{id}` failed to initialize: {}", error.message))
-                            .at(format!("plugins.{id}")),
+                        Issue::error(
+                            error.code,
+                            format!("`{id}` failed to initialize: {}", error.message),
+                        )
+                        .at(format!("plugins.{id}")),
                     );
                     return Err(kernel.cleanup(report).await);
                 }
@@ -408,7 +427,10 @@ impl Kernel {
 
         let (capability, disabled) = {
             let state = kernel.state.lock().unwrap();
-            (state.config.capability.clone(), state.config.disabled.clone())
+            (
+                state.config.capability.clone(),
+                state.config.disabled.clone(),
+            )
         };
         let declarations: Vec<Decl> = decls.values().cloned().collect();
         let outcome = graph::validate(&declarations, &capability, &disabled);
@@ -443,7 +465,13 @@ impl Kernel {
                 .blocked
                 .iter()
                 .map(|(id, missing)| {
-                    (id.clone(), Waiting { missing: missing.clone(), trigger: proto::trigger::BOOT })
+                    (
+                        id.clone(),
+                        Waiting {
+                            missing: missing.clone(),
+                            trigger: proto::trigger::BOOT,
+                        },
+                    )
                 })
                 .collect();
             for (id, instance) in state.plugins.iter_mut() {
@@ -457,7 +485,7 @@ impl Kernel {
         report.capabilities = outcome
             .table
             .iter()
-            .map(|(c, r)| (c.clone(), json!({ "plugin": r.plugin, "version": r.version })))
+            .map(|(c, r)| (c.clone(), json!({ "plugin": r.plugin })))
             .collect();
         report.start_order = order.clone();
         report.disabled = disabled.iter().cloned().collect();
@@ -508,9 +536,15 @@ impl Kernel {
     }
 
     fn assemble(config: Config, check: bool, host: bool) -> Kernel {
-        let sources: Vec<String> =
-            config.sources.iter().map(|path| path.display().to_string()).collect();
-        let report = Report { sources, ..Report::default() };
+        let sources: Vec<String> = config
+            .sources
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        let report = Report {
+            sources,
+            ..Report::default()
+        };
         let mut plugins = BTreeMap::new();
         for (id, cfg) in &config.plugins {
             plugins.insert(
@@ -522,7 +556,11 @@ impl Kernel {
                         pid: None,
                         sink: process::Sink::closed(),
                     },
-                    decl: Decl { id: id.clone(), provides: Vec::new(), requires: Vec::new() },
+                    decl: Decl {
+                        id: id.clone(),
+                        provides: Vec::new(),
+                        requires: Vec::new(),
+                    },
                     view: Arc::new(RoutingTable::new()),
                     waiting: HashMap::new(),
                     next_id: 1,
@@ -538,11 +576,11 @@ impl Kernel {
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
         let (exit_tx, exit_rx) = oneshot::channel();
         let (attached, _) = watch::channel(false);
-    // The embedder is a caller without a pipe: a bounded queue, counted in
-    // bytes like a plugin's, so the same watermarks pause it.
-    let capacity = config.limits.stream_buffer_chunks.max(1);
-    let (host_tx, host_rx) = mpsc::channel::<Value>(capacity);
-    let host_bytes = Arc::new(AtomicUsize::new(0));
+        // The embedder is a caller without a pipe: a bounded queue, counted in
+        // bytes like a plugin's, so the same watermarks pause it.
+        let capacity = config.limits.stream_buffer_chunks.max(1);
+        let (host_tx, host_rx) = mpsc::channel::<Value>(capacity);
+        let host_bytes = Arc::new(AtomicUsize::new(0));
         let path = config.path.clone();
         Kernel {
             state: Mutex::new(State {
@@ -558,7 +596,10 @@ impl Kernel {
                 next_stream: 1,
                 io: IoState::default(),
                 stdout: Stdout::new(),
-                host: HostQueue { tx: host_tx, bytes: host_bytes.clone() },
+                host: HostQueue {
+                    tx: host_tx,
+                    bytes: host_bytes.clone(),
+                },
                 host_inflight: 0,
                 next_host_call: 0,
                 last_activity: Instant::now(),
@@ -572,7 +613,10 @@ impl Kernel {
             exit_tx: Mutex::new(Some(exit_tx)),
             exit_rx: Mutex::new(Some(exit_rx)),
             report: Mutex::new(report),
-            host: Mutex::new(Some(Host { rx: host_rx, bytes: host_bytes })),
+            host: Mutex::new(Some(Host {
+                rx: host_rx,
+                bytes: host_bytes,
+            })),
             stopping: AtomicBool::new(false),
             force_reload: AtomicBool::new(false),
             restart_lock: tokio::sync::Mutex::new(()),
@@ -583,21 +627,34 @@ impl Kernel {
     async fn start_processes(self: Arc<Self>) -> Result<(), Report> {
         let plugs: Vec<(String, PluginSpec)> = {
             let state = self.state.lock().unwrap();
-            state.plugins.iter().map(|(id, i)| (id.clone(), i.cfg.clone())).collect()
+            state
+                .plugins
+                .iter()
+                .map(|(id, i)| (id.clone(), i.cfg.clone()))
+                .collect()
         };
         let config = self.state.lock().unwrap().config.clone();
         let mut frames: Vec<(String, Frames)> = Vec::new();
         for (id, cfg) in plugs {
             match process::spawn(&id, &cfg, &config.limits) {
                 Ok((process, stream)) => {
-                    self.state.lock().unwrap().plugins.get_mut(&id).unwrap().process = process;
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .plugins
+                        .get_mut(&id)
+                        .unwrap()
+                        .process = process;
                     frames.push((id, stream));
                 }
                 Err(error) => {
                     let mut report = self.report.lock().unwrap().clone();
                     report.errors.push(
-                        Issue::error(codes::INVALID_CONFIG, format!("cannot start `{id}`: {error}"))
-                            .at(format!("plugins.{id}")),
+                        Issue::error(
+                            codes::INVALID_CONFIG,
+                            format!("cannot start `{id}`: {error}"),
+                        )
+                        .at(format!("plugins.{id}")),
                     );
                     return Err(self.cleanup(report).await);
                 }
@@ -611,7 +668,10 @@ impl Kernel {
 
     fn first_gone(&self) -> Option<Value> {
         let state = self.state.lock().unwrap();
-        state.plugins.values().find_map(|instance| instance.gone.clone())
+        state
+            .plugins
+            .values()
+            .find_map(|instance| instance.gone.clone())
     }
 
     // -------------------------------------------------------------- dispatch
@@ -621,16 +681,40 @@ impl Kernel {
             while let Some(incoming) = frames.rx.recv().await {
                 self.touch();
                 match incoming {
-                    Incoming::Request { id: call_id, method, params } => {
-                        let kernel = self.clone();
+                    Incoming::Request {
+                        id: call_id,
+                        method,
+                        params,
+                    } => {
                         let plugin = id.clone();
+                        if method == method::KERNEL_PUBLISH {
+                            // An event's meaning is its position in the sequence, and a
+                            // spawn is scheduled by the runtime, not by the sender: two
+                            // broadcasts from one plugin would race and could arrive
+                            // inverted. The handler only queues frames, so it runs here,
+                            // in the order the reader saw them.
+                            self.clone()
+                                .on_request(plugin, call_id, method, params)
+                                .await;
+                            continue;
+                        }
+                        let kernel = self.clone();
                         // Never block the reader: a plugin awaiting one call must
                         // still be able to receive the answer to another.
-                        tokio::spawn(async move { kernel.on_request(plugin, call_id, method, params).await });
+                        tokio::spawn(async move {
+                            kernel.on_request(plugin, call_id, method, params).await
+                        });
                     }
-                    Incoming::Notification { method, params } => self.on_notification(&id, &method, &params),
-                    Incoming::Response { id: call_id, result } => self.resolve(&id, &call_id, Ok(result)),
-                    Incoming::ErrorResponse { id: call_id, error } => self.resolve(&id, &call_id, Err(error)),
+                    Incoming::Notification { method, params } => {
+                        self.on_notification(&id, &method, &params)
+                    }
+                    Incoming::Response {
+                        id: call_id,
+                        result,
+                    } => self.resolve(&id, &call_id, Ok(result)),
+                    Incoming::ErrorResponse { id: call_id, error } => {
+                        self.resolve(&id, &call_id, Err(error))
+                    }
                 }
             }
             let _ = frames.closed.await;
@@ -695,7 +779,10 @@ impl Kernel {
             other => self.reply(
                 &plugin,
                 id,
-                Err(RpcError::new(codes::METHOD_NOT_FOUND, format!("unknown method {other}"))),
+                Err(RpcError::new(
+                    codes::METHOD_NOT_FOUND,
+                    format!("unknown method {other}"),
+                )),
             ),
         }
     }
@@ -741,10 +828,16 @@ impl Kernel {
         };
         match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
             Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) => Err(RpcError::new(codes::INTERNAL_ERROR, "kernel dropped the response")),
+            Ok(Err(_)) => Err(RpcError::new(
+                codes::INTERNAL_ERROR,
+                "kernel dropped the response",
+            )),
             Err(_) => {
                 self.cancel_provider(plugin, id);
-                Err(RpcError::new(codes::REQUEST_TIMEOUT, format!("{name} timed out")))
+                Err(RpcError::new(
+                    codes::REQUEST_TIMEOUT,
+                    format!("{name} timed out"),
+                ))
             }
         }
     }
@@ -782,7 +875,8 @@ impl Kernel {
             }
         };
         if !admitted {
-            let message = format!("`{plugin}` already has as many calls in flight as it is allowed");
+            let message =
+                format!("`{plugin}` already has as many calls in flight as it is allowed");
             return self.reply(plugin, id, Err(RpcError::new(codes::OVERLOADED, message)));
         }
         self.plugin_invoke_inner(plugin, id, params).await;
@@ -797,12 +891,18 @@ impl Kernel {
         let meta = params.get("meta").cloned().unwrap_or_else(|| json!({}));
         // Outbound calls must name their own request_id, or the caller could
         // never cancel them.
-        let Some(request_id) = meta.get("request_id").and_then(Value::as_str).map(str::to_string)
+        let Some(request_id) = meta
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
         else {
             return self.reply(
                 plugin,
                 id,
-                Err(RpcError::new(codes::INVALID_PARAMS, "meta.request_id is required")),
+                Err(RpcError::new(
+                    codes::INVALID_PARAMS,
+                    "meta.request_id is required",
+                )),
             );
         };
         let capability = str_field(&params, "capability");
@@ -814,7 +914,10 @@ impl Kernel {
         // One snapshot per call: a call never sees half of one table.
         let route = {
             let state = self.state.lock().unwrap();
-            state.plugins.get(plugin).and_then(|i| i.view.get(&capability).cloned())
+            state
+                .plugins
+                .get(plugin)
+                .and_then(|i| i.view.get(&capability).cloned())
         };
         let Some(route) = route else {
             return self.reply(
@@ -833,7 +936,16 @@ impl Kernel {
 
         if !stream {
             let outcome = self
-                .forward(plugin, &request_id, &provider, &capability, &method_name, inner, None, timeout)
+                .forward(
+                    plugin,
+                    &request_id,
+                    &provider,
+                    &capability,
+                    &method_name,
+                    inner,
+                    None,
+                    timeout,
+                )
                 .await;
             return self.reply(plugin, id, outcome);
         }
@@ -975,7 +1087,9 @@ impl Kernel {
                 (provider.to_string(), id),
             );
             if let Some(sid) = stream_sid {
-                state.stream_calls.insert((provider.to_string(), id), sid.to_string());
+                state
+                    .stream_calls
+                    .insert((provider.to_string(), id), sid.to_string());
                 if let Some(stream) = state.streams.get_mut(sid) {
                     stream.provider_request_id = id;
                 }
@@ -985,7 +1099,10 @@ impl Kernel {
 
         let outcome = match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
             Ok(Ok(outcome)) => outcome,
-            Ok(Err(_)) => Err(RpcError::new(codes::INTERNAL_ERROR, "kernel dropped the response")),
+            Ok(Err(_)) => Err(RpcError::new(
+                codes::INTERNAL_ERROR,
+                "kernel dropped the response",
+            )),
             Err(_) => {
                 self.cancel_provider(provider, provider_request_id);
                 Err(RpcError::new(
@@ -996,8 +1113,12 @@ impl Kernel {
         };
         {
             let mut state = self.state.lock().unwrap();
-            state.calls.remove(&(caller.to_string(), caller_request_id.to_string()));
-            state.stream_calls.remove(&(provider.to_string(), provider_request_id));
+            state
+                .calls
+                .remove(&(caller.to_string(), caller_request_id.to_string()));
+            state
+                .stream_calls
+                .remove(&(provider.to_string(), provider_request_id));
         }
         outcome
     }
@@ -1022,7 +1143,10 @@ impl Kernel {
     }
 
     fn on_provider_chunk(&self, provider: &str, params: &Value) {
-        let Some(provider_sid) = params.get("stream_id").and_then(Value::as_str).map(str::to_string)
+        let Some(provider_sid) = params
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
         else {
             return;
         };
@@ -1056,12 +1180,18 @@ impl Kernel {
     }
 
     fn on_provider_error(&self, provider: &str, params: &Value) {
-        let Some(provider_sid) = params.get("stream_id").and_then(Value::as_str).map(str::to_string)
+        let Some(provider_sid) = params
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
         else {
             return;
         };
         let error = RpcError {
-            code: params.get("code").and_then(Value::as_i64).unwrap_or(codes::INTERNAL_ERROR),
+            code: params
+                .get("code")
+                .and_then(Value::as_i64)
+                .unwrap_or(codes::INTERNAL_ERROR),
             message: params
                 .get("message")
                 .and_then(Value::as_str)
@@ -1082,7 +1212,9 @@ impl Kernel {
     fn push_chunk(&self, caller_sid: &str, data: Value, done: bool) {
         let kernel = self.cfg();
         let mut state = self.state.lock().unwrap();
-        let Some(stream) = state.streams.get_mut(caller_sid) else { return };
+        let Some(stream) = state.streams.get_mut(caller_sid) else {
+            return;
+        };
         if stream.dead {
             log::debug(
                 "kernel",
@@ -1111,7 +1243,10 @@ impl Kernel {
             }
             if overflowed {
                 drop(state);
-                log::warn("kernel", &format!("stream {caller_sid} overflowed its buffer; terminating"));
+                log::warn(
+                    "kernel",
+                    &format!("stream {caller_sid} overflowed its buffer; terminating"),
+                );
                 self.terminate_stream(
                     caller_sid,
                     Some(RpcError::new(codes::OVERLOADED, "stream buffer overflowed")),
@@ -1121,21 +1256,32 @@ impl Kernel {
         }
         if !Self::deliver(&state, &caller, &frame) {
             drop(state);
-            log::warn("kernel", &format!("stream {caller_sid} outran its caller; terminating"));
-            self.terminate_stream(caller_sid, Some(RpcError::new(codes::OVERLOADED, "the caller queue is full")));
+            log::warn(
+                "kernel",
+                &format!("stream {caller_sid} outran its caller; terminating"),
+            );
+            self.terminate_stream(
+                caller_sid,
+                Some(RpcError::new(codes::OVERLOADED, "the caller queue is full")),
+            );
         }
     }
 
     /// Ends a stream, cancelling the provider and (optionally) telling the caller.
     fn terminate_stream(&self, caller_sid: &str, error: Option<RpcError>) {
         let mut state = self.state.lock().unwrap();
-        let Some(stream) = state.streams.remove(caller_sid) else { return };
+        let Some(stream) = state.streams.remove(caller_sid) else {
+            return;
+        };
         state.upstream.retain(|_, sid| sid != caller_sid);
         state.stream_calls.retain(|(provider, id), _| {
             !(provider == &stream.provider && *id == stream.provider_request_id)
         });
         if stream.provider_request_id != 0 {
-            let frame = proto::notify(method::CANCEL, json!({ "request_id": stream.provider_request_id }));
+            let frame = proto::notify(
+                method::CANCEL,
+                json!({ "request_id": stream.provider_request_id }),
+            );
             if let Some(instance) = state.plugins.get(&stream.provider) {
                 instance.sink().send(&frame);
             }
@@ -1165,7 +1311,9 @@ impl Kernel {
         let mut state = self.state.lock().unwrap();
         let ids: Vec<String> = state.streams.keys().cloned().collect();
         for id in ids {
-            let Some(stream) = state.streams.get(&id) else { continue };
+            let Some(stream) = state.streams.get(&id) else {
+                continue;
+            };
             let caller = stream.caller.clone();
             let provider = stream.provider.clone();
             let provider_request_id = stream.provider_request_id;
@@ -1183,7 +1331,10 @@ impl Kernel {
             if idle {
                 drop(state);
                 log::warn("kernel", &format!("stream {id} went idle; cancelling"));
-                self.terminate_stream(&id, Some(RpcError::new(codes::REQUEST_TIMEOUT, "stream went idle")));
+                self.terminate_stream(
+                    &id,
+                    Some(RpcError::new(codes::REQUEST_TIMEOUT, "stream went idle")),
+                );
                 state = self.state.lock().unwrap();
                 continue;
             }
@@ -1202,8 +1353,14 @@ impl Kernel {
             }
             if shed {
                 drop(state);
-                log::warn("kernel", &format!("stream {id} outran its caller; terminating"));
-                self.terminate_stream(&id, Some(RpcError::new(codes::OVERLOADED, "the caller queue is full")));
+                log::warn(
+                    "kernel",
+                    &format!("stream {id} outran its caller; terminating"),
+                );
+                self.terminate_stream(
+                    &id,
+                    Some(RpcError::new(codes::OVERLOADED, "the caller queue is full")),
+                );
                 state = self.state.lock().unwrap();
                 continue;
             }
@@ -1220,9 +1377,14 @@ impl Kernel {
         let target = {
             let mut state = self.state.lock().unwrap();
             if let Some(sid) = params.get("stream_id").and_then(Value::as_str) {
-                state.streams.remove(sid).map(|stream| (stream.provider, stream.provider_request_id))
+                state
+                    .streams
+                    .remove(sid)
+                    .map(|stream| (stream.provider, stream.provider_request_id))
             } else if let Some(request_id) = params.get("request_id").and_then(Value::as_str) {
-                state.calls.remove(&(plugin.to_string(), request_id.to_string()))
+                state
+                    .calls
+                    .remove(&(plugin.to_string(), request_id.to_string()))
             } else {
                 None
             }
@@ -1263,7 +1425,9 @@ impl Kernel {
             });
         }
         let payload = params.get("payload").cloned().unwrap_or(Value::Null);
-        let size = serde_json::to_string(&payload).map(|text| text.len()).unwrap_or(0);
+        let size = serde_json::to_string(&payload)
+            .map(|text| text.len())
+            .unwrap_or(0);
         let limit = self.cfg().event_payload_bytes;
         if size > limit {
             return Err(RpcError::new(
@@ -1279,10 +1443,18 @@ impl Kernel {
         let patterns: Vec<String> = params
             .get("patterns")
             .and_then(Value::as_array)
-            .map(|list| list.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .map(|list| {
+                list.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default();
         if patterns.is_empty() {
-            return Err(RpcError::new(codes::INVALID_PARAMS, "patterns must not be empty"));
+            return Err(RpcError::new(
+                codes::INVALID_PARAMS,
+                "patterns must not be empty",
+            ));
         }
         let id = self.state.lock().unwrap().bus.subscribe(plugin, patterns);
         Ok(json!({ "subscription_id": format!("sub-{id}") }))
@@ -1294,16 +1466,27 @@ impl Kernel {
             .strip_prefix("sub-")
             .unwrap_or(&raw)
             .parse()
-            .map_err(|_| RpcError::new(codes::INVALID_PARAMS, format!("bad subscription_id {raw:?}")))?;
+            .map_err(|_| {
+                RpcError::new(
+                    codes::INVALID_PARAMS,
+                    format!("bad subscription_id {raw:?}"),
+                )
+            })?;
         if self.state.lock().unwrap().bus.unsubscribe(id) {
             Ok(json!({}))
         } else {
-            Err(RpcError::new(codes::UNKNOWN_SUBSCRIPTION, format!("no subscription {raw}")))
+            Err(RpcError::new(
+                codes::UNKNOWN_SUBSCRIPTION,
+                format!("no subscription {raw}"),
+            ))
         }
     }
 
     fn on_log(&self, plugin: &str, params: &Value) {
-        let level = params.get("level").and_then(Value::as_str).unwrap_or("info");
+        let level = params
+            .get("level")
+            .and_then(Value::as_str)
+            .unwrap_or("info");
         let message = params.get("message").and_then(Value::as_str).unwrap_or("");
         let mut fields = params.get("fields").cloned().unwrap_or_else(|| json!({}));
         if let Some(object) = fields.as_object_mut() {
@@ -1312,7 +1495,10 @@ impl Kernel {
         let rendered = log::format_line(level, "plugin", message, &fields);
         let limit = self.cfg().event_payload_bytes;
         if rendered.len() > limit {
-            log::warn("kernel", &format!("plugin={plugin} log dropped size={}", rendered.len()));
+            log::warn(
+                "kernel",
+                &format!("plugin={plugin} log dropped size={}", rendered.len()),
+            );
             return;
         }
         log::emit(level, "plugin", message, fields);
@@ -1325,7 +1511,11 @@ impl Kernel {
             return Err(Self::no_terminal(method::KERNEL_ATTACH));
         }
         let stream = str_field(params, "stream");
-        let mode = params.get("mode").and_then(Value::as_str).unwrap_or("line").to_string();
+        let mode = params
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("line")
+            .to_string();
         {
             let mut state = self.state.lock().unwrap();
             match stream.as_str() {
@@ -1351,7 +1541,7 @@ impl Kernel {
                     return Err(RpcError::new(
                         codes::INVALID_PARAMS,
                         format!("unknown stream {other:?}"),
-                    ))
+                    ));
                 }
             }
         }
@@ -1380,7 +1570,7 @@ impl Kernel {
                     return Err(RpcError::new(
                         codes::INVALID_PARAMS,
                         format!("unknown stream {other:?}"),
-                    ))
+                    ));
                 }
             }
         }
@@ -1399,18 +1589,28 @@ impl Kernel {
             return Err(Self::no_terminal(method::KERNEL_WRITE));
         }
         if str_field(params, "stream") != "stdout" {
-            return Err(RpcError::new(codes::INVALID_PARAMS, "kernel.write only writes to stdout"));
+            return Err(RpcError::new(
+                codes::INVALID_PARAMS,
+                "kernel.write only writes to stdout",
+            ));
         }
         let data = str_field(params, "data");
         let kernel = self.cfg();
         let state = self.state.lock().unwrap();
         state
             .stdout
-            .write(&data, kernel.io_write_queue_bytes, kernel.event_payload_bytes)
+            .write(
+                &data,
+                kernel.io_write_queue_bytes,
+                kernel.event_payload_bytes,
+            )
             .map_err(|code| {
                 RpcError::new(
                     code,
-                    format!("stdout is not accepting writes right now ({})", codes::name(code)),
+                    format!(
+                        "stdout is not accepting writes right now ({})",
+                        codes::name(code)
+                    ),
                 )
             })?;
         Ok(json!({}))
@@ -1423,7 +1623,10 @@ impl Kernel {
             match state.io.stdin_owner.clone() {
                 Some(owner) => owner,
                 None => {
-                    log::warn("kernel", "stdin data arrived with no attach owner; discarded");
+                    log::warn(
+                        "kernel",
+                        "stdin data arrived with no attach owner; discarded",
+                    );
                     return;
                 }
             }
@@ -1456,7 +1659,12 @@ impl Kernel {
             let state = self.state.lock().unwrap();
             let instance = match state.plugins.get(id) {
                 Some(instance) => instance,
-                None => return Err(RpcError::new(codes::INVALID_PARAMS, format!("no plugin `{id}`"))),
+                None => {
+                    return Err(RpcError::new(
+                        codes::INVALID_PARAMS,
+                        format!("no plugin `{id}`"),
+                    ));
+                }
             };
             (
                 to_json(&state.table),
@@ -1470,7 +1678,8 @@ impl Kernel {
         };
         // The snapshot handed over here is a starting reference; changes arrive
         // as `kernel.capabilities.changed`.
-        self.call(id, method::START, json!({ "capabilities": caps }), timeout).await?;
+        self.call(id, method::START, json!({ "capabilities": caps }), timeout)
+            .await?;
         {
             let mut state = self.state.lock().unwrap();
             let instance = state.plugins.get_mut(id).unwrap();
@@ -1494,7 +1703,9 @@ impl Kernel {
 
     fn send_shutdown(&self, plugin: &str, reason: &str, trigger: Option<&'static str>) -> bool {
         let mut state = self.state.lock().unwrap();
-        let Some(instance) = state.plugins.get_mut(plugin) else { return false };
+        let Some(instance) = state.plugins.get_mut(plugin) else {
+            return false;
+        };
         if instance.gone.is_some() || instance.shutting_down {
             return false;
         }
@@ -1618,7 +1829,7 @@ impl Kernel {
         {
             let kernel = self.clone();
             tokio::spawn(async move {
-                use tokio::signal::unix::{signal, SignalKind};
+                use tokio::signal::unix::{SignalKind, signal};
                 let mut hup = match signal(SignalKind::hangup()) {
                     Ok(stream) => stream,
                     Err(_) => return,
@@ -1675,11 +1886,7 @@ impl Kernel {
         }
         self.wait_until_gone().await;
         let killed = self.force_kill_remaining().await;
-        if killed > 0 || truncated {
-            2
-        } else {
-            0
-        }
+        if killed > 0 || truncated { 2 } else { 0 }
     }
 
     // ---------------------------------------------------------- hot reload
@@ -1712,15 +1919,27 @@ impl Kernel {
         let fresh = match Config::load(&self.path, &env) {
             Ok(config) => config,
             Err(error) => {
-                log::error("kernel", &format!("reload rejected: {error}; keeping the running config"));
+                log::error(
+                    "kernel",
+                    &format!("reload rejected: {error}; keeping the running config"),
+                );
                 return;
             }
         };
 
         let old = self.state.lock().unwrap().config.clone();
         let ids: Vec<String> = old.plugins.keys().cloned().collect();
-        let added: Vec<String> = fresh.plugins.keys().filter(|id| !ids.contains(id)).cloned().collect();
-        let removed: Vec<String> = ids.iter().filter(|id| !fresh.plugins.contains_key(*id)).cloned().collect();
+        let added: Vec<String> = fresh
+            .plugins
+            .keys()
+            .filter(|id| !ids.contains(id))
+            .cloned()
+            .collect();
+        let removed: Vec<String> = ids
+            .iter()
+            .filter(|id| !fresh.plugins.contains_key(*id))
+            .cloned()
+            .collect();
         let changed: Vec<String> = ids
             .iter()
             .filter(|id| match fresh.plugins.get(*id) {
@@ -1740,7 +1959,10 @@ impl Kernel {
             if !outcome.errors.is_empty() {
                 log::error(
                     "kernel",
-                    &format!("reload rejected: {}; keeping the running config", outcome.errors[0].message),
+                    &format!(
+                        "reload rejected: {}; keeping the running config",
+                        outcome.errors[0].message
+                    ),
                 );
                 return;
             }
@@ -1753,7 +1975,9 @@ impl Kernel {
                     instance.view = table.clone();
                 }
             }
-            self.clone().settle(&fresh, &[], proto::trigger::CONFIG).await;
+            self.clone()
+                .settle(&fresh, &[], proto::trigger::CONFIG)
+                .await;
             self.publish_event(
                 "kernel.capabilities.changed",
                 json!({ "capabilities": to_json(&outcome.table) }),
@@ -1764,13 +1988,21 @@ impl Kernel {
                 json!({ "path": self.path.display().to_string() }),
                 64,
             );
-            log::info("kernel", "reloaded the routing table only; no process was restarted");
+            log::info(
+                "kernel",
+                "reloaded the routing table only; no process was restarted",
+            );
             return;
         }
 
         log::info(
             "kernel",
-            &format!("reload: +{} ~{} -{}", added.len(), changed.len(), removed.len()),
+            &format!(
+                "reload: +{} ~{} -{}",
+                added.len(),
+                changed.len(),
+                removed.len()
+            ),
         );
 
         let new_ids: Vec<String> = added.iter().chain(changed.iter()).cloned().collect();
@@ -1778,15 +2010,25 @@ impl Kernel {
             if let Err(error) = self.stop_plugin(id, proto::trigger::CONFIG).await {
                 log::error(
                     "kernel",
-                    &format!("reload rejected: {}; keeping the running config", error.message),
+                    &format!(
+                        "reload rejected: {}; keeping the running config",
+                        error.message
+                    ),
                 );
                 return;
             }
         }
-        if let Err(error) = self.clone().bring_up(&new_ids, &fresh, &removed, proto::trigger::CONFIG).await {
+        if let Err(error) = self
+            .clone()
+            .bring_up(&new_ids, &fresh, &removed, proto::trigger::CONFIG)
+            .await
+        {
             log::error(
                 "kernel",
-                &format!("reload rejected: {}; keeping the running config", error.message),
+                &format!(
+                    "reload rejected: {}; keeping the running config",
+                    error.message
+                ),
             );
             return;
         }
@@ -1797,7 +2039,9 @@ impl Kernel {
         );
         log::info("kernel", "reload applied");
 
-        self.clone().settle(&fresh, &removed, proto::trigger::CONFIG).await;
+        self.clone()
+            .settle(&fresh, &removed, proto::trigger::CONFIG)
+            .await;
         if !removed.is_empty() {
             let kernel = self.clone();
             let removed = removed.clone();
@@ -1822,7 +2066,11 @@ impl Kernel {
                         Instance {
                             cfg,
                             process,
-                            decl: Decl { id: id.clone(), provides: Vec::new(), requires: Vec::new() },
+                            decl: Decl {
+                                id: id.clone(),
+                                provides: Vec::new(),
+                                requires: Vec::new(),
+                            },
                             view: Arc::new(RoutingTable::new()),
                             waiting: HashMap::new(),
                             next_id: 1,
@@ -1838,7 +2086,10 @@ impl Kernel {
                 }
                 Err(error) => {
                     self.abort_reload(&new_ids, trigger).await;
-                    return Err(RpcError::new(codes::INVALID_CONFIG, format!("cannot start `{id}`: {error}")));
+                    return Err(RpcError::new(
+                        codes::INVALID_CONFIG,
+                        format!("cannot start `{id}`: {error}"),
+                    ));
                 }
             }
         }
@@ -1860,7 +2111,10 @@ impl Kernel {
             let (timeout, plugin_config) = {
                 let state = self.state.lock().unwrap();
                 let instance = state.plugins.get(id).unwrap();
-                (instance.cfg.timeouts.initialize(&state.config.limits), instance.cfg.config.clone())
+                (
+                    instance.cfg.timeouts.initialize(&state.config.limits),
+                    instance.cfg.config.clone(),
+                )
             };
             let params = json!({
                 "protocol": proto::PROTOCOL_VERSION,
@@ -1875,12 +2129,18 @@ impl Kernel {
                     }
                     Err(issue) => {
                         self.abort_reload(&new_ids, trigger).await;
-                        return Err(RpcError::new(issue.code, format!("`{id}`: {}", issue.message)));
+                        return Err(RpcError::new(
+                            issue.code,
+                            format!("`{id}`: {}", issue.message),
+                        ));
                     }
                 },
                 Err(error) => {
                     self.abort_reload(&new_ids, trigger).await;
-                    return Err(RpcError::new(error.code, format!("`{id}` failed to initialize: {}", error.message)));
+                    return Err(RpcError::new(
+                        error.code,
+                        format!("`{id}` failed to initialize: {}", error.message),
+                    ));
                 }
             }
         }
@@ -1889,7 +2149,10 @@ impl Kernel {
         let outcome = graph::validate(&declarations, &fresh.capability, &fresh.disabled);
         if !outcome.errors.is_empty() {
             self.abort_reload(&new_ids, trigger).await;
-            return Err(RpcError::new(outcome.errors[0].code, outcome.errors[0].message.clone()));
+            return Err(RpcError::new(
+                outcome.errors[0].code,
+                outcome.errors[0].message.clone(),
+            ));
         }
         let order = match graph::start_order(&declarations, &outcome.table) {
             Ok(order) => order,
@@ -1922,7 +2185,10 @@ impl Kernel {
         {
             if let Err(error) = self.start_plugin(id, trigger).await {
                 self.abort_reload(&new_ids, trigger).await;
-                return Err(RpcError::new(error.code, format!("`{id}` failed to start: {}", error.message)));
+                return Err(RpcError::new(
+                    error.code,
+                    format!("`{id}` failed to start: {}", error.message),
+                ));
             }
         }
 
@@ -2021,7 +2287,10 @@ impl Kernel {
         };
         let outcome = graph::validate(&declarations, &fresh.capability, &fresh.disabled);
         if !outcome.errors.is_empty() {
-            log::error("kernel", &format!("waiting pass rejected: {}", outcome.errors[0].message));
+            log::error(
+                "kernel",
+                &format!("waiting pass rejected: {}", outcome.errors[0].message),
+            );
             return BTreeSet::new();
         }
         let blocked = outcome.blocked.clone();
@@ -2057,15 +2326,25 @@ impl Kernel {
             if let Err(error) = self.start_plugin(id, trigger).await {
                 log::error(
                     "kernel",
-                    &format!("`{id}` could not leave the waiting state: {}", error.message),
+                    &format!(
+                        "`{id}` could not leave the waiting state: {}",
+                        error.message
+                    ),
                 );
             }
         }
         for id in &respawn {
-            if let Err(error) = self.clone().bring_up(std::slice::from_ref(id), fresh, &[], trigger).await {
+            if let Err(error) = self
+                .clone()
+                .bring_up(std::slice::from_ref(id), fresh, &[], trigger)
+                .await
+            {
                 log::error(
                     "kernel",
-                    &format!("`{id}` could not leave the waiting state: {}", error.message),
+                    &format!(
+                        "`{id}` could not leave the waiting state: {}",
+                        error.message
+                    ),
                 );
             }
         }
@@ -2073,7 +2352,15 @@ impl Kernel {
             let mut state = self.state.lock().unwrap();
             state.blocked = blocked
                 .iter()
-                .map(|(id, missing)| (id.clone(), Waiting { missing: missing.clone(), trigger }))
+                .map(|(id, missing)| {
+                    (
+                        id.clone(),
+                        Waiting {
+                            missing: missing.clone(),
+                            trigger,
+                        },
+                    )
+                })
                 .collect();
         }
         for (id, missing) in &blocked {
@@ -2110,21 +2397,34 @@ impl Kernel {
             instance.started = false;
         }
     }
-    async fn restart_plugin(self: Arc<Self>, id: &str, trigger: &'static str) -> Result<(), RpcError> {
+    async fn restart_plugin(
+        self: Arc<Self>,
+        id: &str,
+        trigger: &'static str,
+    ) -> Result<(), RpcError> {
         let _guard = self.restart_lock.lock().await;
         let fresh = self.state.lock().unwrap().config.clone();
         if !fresh.plugins.contains_key(id) {
-            return Err(RpcError::new(codes::INVALID_PARAMS, format!("no plugin `{id}`")));
+            return Err(RpcError::new(
+                codes::INVALID_PARAMS,
+                format!("no plugin `{id}`"),
+            ));
         }
         self.stop_plugin(id, trigger).await?;
-        let outcome = self.clone().bring_up(&[id.to_string()], &fresh, &[], trigger).await;
+        let outcome = self
+            .clone()
+            .bring_up(&[id.to_string()], &fresh, &[], trigger)
+            .await;
         if outcome.is_ok() {
             self.clone().settle(&fresh, &[], trigger).await;
         }
         if let Err(error) = &outcome {
             log::error(
                 "kernel",
-                &format!("restart rejected: {}; `{id}` stays unavailable until the next restart", error.message),
+                &format!(
+                    "restart rejected: {}; `{id}` stays unavailable until the next restart",
+                    error.message
+                ),
             );
         }
         outcome.map_err(|error| RpcError {
@@ -2180,7 +2480,10 @@ impl Kernel {
         // `wait` can yield, so the child is taken out of the lock first.
         let child = {
             let mut state = self.state.lock().unwrap();
-            state.plugins.get_mut(plugin).and_then(|i| i.process.child.take())
+            state
+                .plugins
+                .get_mut(plugin)
+                .and_then(|i| i.process.child.take())
         };
         let mut child = child;
         let status = match child.as_mut() {
@@ -2240,7 +2543,10 @@ impl Kernel {
             return;
         }
         if !expected {
-            log::warn("kernel", &format!("plugin={plugin} exited unexpectedly: {detail}"));
+            log::warn(
+                "kernel",
+                &format!("plugin={plugin} exited unexpectedly: {detail}"),
+            );
             self.publish_event(
                 "kernel.plugin.degraded",
                 json!({
@@ -2266,9 +2572,6 @@ impl Kernel {
     }
 }
 
-
-
-
 // ----------------------------------------------------------------- the host
 
 /// The kernel's end of the host queue. Bounded like a stream buffer and counted
@@ -2285,7 +2588,8 @@ impl HostQueue {
         if self.tx.try_send(frame.clone()).is_err() {
             return false;
         }
-        self.bytes.fetch_add(frame.to_string().len(), Ordering::Relaxed);
+        self.bytes
+            .fetch_add(frame.to_string().len(), Ordering::Relaxed);
         true
     }
 
@@ -2309,7 +2613,8 @@ impl Host {
         let value = self.rx.recv().await?;
         let size = value.to_string().len();
         let queued = self.bytes.load(Ordering::Relaxed);
-        self.bytes.store(queued.saturating_sub(size), Ordering::Relaxed);
+        self.bytes
+            .store(queued.saturating_sub(size), Ordering::Relaxed);
         Some(value)
     }
 
@@ -2321,7 +2626,7 @@ impl Host {
 
 impl Kernel {
     /// The routing table as `start` hands it to a plugin: capability id ->
-    /// `{plugin, version}`. A host has no snapshot of its own, so this is how it
+    /// `{plugin}`. A host has no snapshot of its own, so this is how it
     /// learns what exists before any event arrives.
     pub fn capabilities(&self) -> Value {
         to_json(&self.state.lock().unwrap().table)
@@ -2340,7 +2645,8 @@ impl Kernel {
         method_name: &str,
         params: Value,
     ) -> Result<Value, RpcError> {
-        self.host_invoke(capability, method_name, params, false).await
+        self.host_invoke(capability, method_name, params, false)
+            .await
     }
 
     /// Same, with `stream`. The reply is the provider's `{stream_id}` and the
@@ -2351,7 +2657,8 @@ impl Kernel {
         method_name: &str,
         params: Value,
     ) -> Result<Value, RpcError> {
-        self.host_invoke(capability, method_name, params, true).await
+        self.host_invoke(capability, method_name, params, true)
+            .await
     }
 
     /// Subscribes the embedder to event topics, exactly like a plugin would.
@@ -2360,7 +2667,10 @@ impl Kernel {
         if replay {
             self.announce_running();
         }
-        Ok(reply["subscription_id"].as_str().unwrap_or_default().to_string())
+        Ok(reply["subscription_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
     }
 
     fn announce_running(&self) {
@@ -2403,7 +2713,8 @@ impl Kernel {
     }
 
     pub fn unsubscribe(&self, subscription_id: &str) -> Result<(), RpcError> {
-        self.unsubscribe_as(&json!({ "subscription_id": subscription_id })).map(|_| ())
+        self.unsubscribe_as(&json!({ "subscription_id": subscription_id }))
+            .map(|_| ())
     }
 
     /// The host has no instance view: it routes through the kernel's own table.
@@ -2422,7 +2733,7 @@ impl Kernel {
                     return Err(RpcError::new(
                         codes::UNKNOWN_CAPABILITY,
                         format!("no provider is configured for `{capability}`"),
-                    ))
+                    ));
                 }
             }
         };
@@ -2441,7 +2752,10 @@ impl Kernel {
             !full
         };
         if !admitted {
-            return Err(RpcError::new(codes::OVERLOADED, "the host is at its in-flight limit"));
+            return Err(RpcError::new(
+                codes::OVERLOADED,
+                "the host is at its in-flight limit",
+            ));
         }
         let request_id = {
             let mut state = self.state.lock().unwrap();
@@ -2450,12 +2764,28 @@ impl Kernel {
             format!("host-{n}")
         };
         let outcome = if stream {
-            let sid =
-                self.start_stream(HOST, &provider, capability, method_name, params, &request_id, None);
+            let sid = self.start_stream(
+                HOST,
+                &provider,
+                capability,
+                method_name,
+                params,
+                &request_id,
+                None,
+            );
             Ok(json!({ "stream_id": sid }))
         } else {
-            self.forward(HOST, &request_id, &provider, capability, method_name, params, None, None)
-                .await
+            self.forward(
+                HOST,
+                &request_id,
+                &provider,
+                capability,
+                method_name,
+                params,
+                None,
+                None,
+            )
+            .await
         };
         let mut state = self.state.lock().unwrap();
         state.host_inflight = state.host_inflight.saturating_sub(1);
@@ -2487,7 +2817,11 @@ impl Kernel {
         let _ = self.shutdown_tx.send(reason);
     }
 
-    pub async fn restart(self: &Arc<Self>, plugin: &str, trigger: &'static str) -> Result<(), RpcError> {
+    pub async fn restart(
+        self: &Arc<Self>,
+        plugin: &str,
+        trigger: &'static str,
+    ) -> Result<(), RpcError> {
         self.clone().restart_plugin(plugin, trigger).await
     }
 

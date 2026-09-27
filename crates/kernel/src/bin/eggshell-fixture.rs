@@ -3,14 +3,14 @@
 //! It is the kernel integration tests' test double, built only with
 //! `--features fixture`, so a default build never produces a binary.
 //!
-//!     eggshell-fixture --provides demo.text=1.0.0 [options]
+//!     eggshell-fixture --provides demo.text [options]
 //!
-//! Options: `--requires <cap>=<range>` (repeatable), `--chunks <n>`,
+//! Options: `--requires <capability>` (repeatable), `--chunks <n>`,
 //! `--exit-on-start`, `--exit-on-invoke`, `--exit-if <path>`.
 
 use std::process::ExitCode;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 
 use protocol as proto;
@@ -20,7 +20,7 @@ const MAX_FRAME_BYTES: usize = 1 << 20;
 
 #[derive(Default)]
 struct Args {
-    provides: Vec<(String, String)>,
+    provides: Vec<String>,
     requires: Vec<Value>,
     chunks: usize,
     exit_on_start: bool,
@@ -34,15 +34,14 @@ fn parse() -> Args {
     while let Some(flag) = rest.next() {
         match flag.as_str() {
             "--provides" => {
-                if let Some((capability, version)) = rest.next().as_deref().and_then(split_spec) {
-                    args.provides.push((capability.to_string(), version.to_string()));
+                if let Some(capability) = rest.next() {
+                    args.provides.push(capability);
                 }
             }
             "--requires" => {
-                if let Some((capability, range)) = rest.next().as_deref().and_then(split_spec) {
+                if let Some(capability) = rest.next() {
                     args.requires.push(json!({
                         "capability": capability,
-                        "version": range,
                         "optional": false,
                     }));
                 }
@@ -57,14 +56,14 @@ fn parse() -> Args {
     args
 }
 
-fn split_spec(spec: &str) -> Option<(&str, &str)> {
-    spec.split_once('=')
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let args = parse();
-    if args.exit_if.as_deref().is_some_and(|path| std::path::Path::new(path).exists()) {
+    if args
+        .exit_if
+        .as_deref()
+        .is_some_and(|path| std::path::Path::new(path).exists())
+    {
         return ExitCode::from(9);
     }
     let mut reader = BufReader::new(tokio::io::stdin());
@@ -76,31 +75,31 @@ async fn main() -> ExitCode {
             // test double needs to do to be a well-behaved plugin.
             Ok(None) | Err(_) => return ExitCode::SUCCESS,
             Ok(Some(payload)) => {
-                let Ok(incoming) = proto::parse_frame(&payload) else { continue };
+                let Ok(incoming) = proto::parse_frame(&payload) else {
+                    continue;
+                };
                 // Notifications are not requests, so they cannot go through the
                 // match below - but the test double still says what it heard, on
                 // stderr, where the kernel's log picks it up: that is how the
                 // process-level tests prove a cancel reached a provider.
                 if let Incoming::Notification { method, params } = &incoming {
                     if method.as_str() == proto::method::CANCEL {
-                        let id = params.get("request_id").map(|value| value.to_string()).unwrap_or_default();
+                        let id = params
+                            .get("request_id")
+                            .map(|value| value.to_string())
+                            .unwrap_or_default();
                         eprintln!("fixture: cancelled request={id}");
                     }
                     continue;
                 }
-                let Incoming::Request { id, method, params } = incoming else { continue };
+                let Incoming::Request { id, method, params } = incoming else {
+                    continue;
+                };
                 match method.as_str() {
                     proto::method::INITIALIZE => {
-                        let provides: Vec<Value> = args
-                            .provides
-                            .iter()
-                            .map(|(capability, version)| {
-                                json!({ "capability": capability, "version": version })
-                            })
-                            .collect();
                         let reply = json!({
                             "protocol": proto::PROTOCOL_VERSION,
-                            "provides": provides,
+                            "provides": args.provides,
                             "requires": args.requires,
                         });
                         send(&mut out, &proto::success(id, reply)).await;
@@ -143,7 +142,8 @@ async fn main() -> ExitCode {
                                 "data": { "delta": format!("c{n}") },
                                 "done": false,
                             });
-                            send(&mut out, &proto::notify(proto::method::STREAM_CHUNK, chunk)).await;
+                            send(&mut out, &proto::notify(proto::method::STREAM_CHUNK, chunk))
+                                .await;
                         }
                         let terminal = json!({
                             "stream_id": "s-1",
@@ -151,7 +151,11 @@ async fn main() -> ExitCode {
                             "data": null,
                             "done": true,
                         });
-                        send(&mut out, &proto::notify(proto::method::STREAM_CHUNK, terminal)).await;
+                        send(
+                            &mut out,
+                            &proto::notify(proto::method::STREAM_CHUNK, terminal),
+                        )
+                        .await;
                     }
                     other => {
                         let error = proto::RpcError::new(-32601, format!("no {other} here"));
