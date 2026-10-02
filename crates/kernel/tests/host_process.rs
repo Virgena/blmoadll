@@ -979,7 +979,7 @@ args = ["--provides", "demo.text"]
 
 [plugins.waiter]
 command = '{FIXTURE}'
-args = ["--provides", "demo.wait", "--requires", "demo.text"]
+args = ["--provides", "demo.wait", "--injects", "demo.text"]
 "#
     )
 }

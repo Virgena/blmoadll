@@ -340,9 +340,13 @@ impl Kernel {
                     "id": id,
                     "command": instance.cfg.command.display().to_string(),
                     "provides": instance.decl.provides,
-                    "requires": instance.decl.requires.iter()
+                    "injects": instance.decl.injects.iter()
                         .map(|r| json!({"capability": r.capability, "optional": r.optional}))
                         .collect::<Vec<_>>(),
+                    "registrations": instance.decl.registrations.iter()
+                        .map(|r| json!({"service": r.service, "capability": r.capability}))
+                        .collect::<Vec<_>>(),
+                    "host_calls": instance.decl.host_calls,
                 })
             })
             .collect()
@@ -559,7 +563,9 @@ impl Kernel {
                     decl: Decl {
                         id: id.clone(),
                         provides: Vec::new(),
-                        requires: Vec::new(),
+                        injects: Vec::new(),
+                        registrations: Vec::new(),
+                        host_calls: Vec::new(),
                     },
                     view: Arc::new(RoutingTable::new()),
                     waiting: HashMap::new(),
@@ -1046,6 +1052,23 @@ impl Kernel {
         timeout: Option<u64>,
     ) -> Result<Value, RpcError> {
         let timeout_ms = timeout.unwrap_or_else(|| self.provider_timeout(provider));
+        let registration = {
+            let requested = params.get("capability").and_then(Value::as_str);
+            let state = self.state.lock().unwrap();
+            requested.and_then(|requested| {
+                state.plugins.get(caller).and_then(|instance| {
+                    instance
+                        .decl
+                        .registrations
+                        .iter()
+                        .find(|registration| {
+                            registration.service == capability
+                                && registration.capability == requested
+                        })
+                        .cloned()
+                })
+            })
+        };
         let (provider_request_id, rx) = {
             let mut state = self.state.lock().unwrap();
             let Some(instance) = state.plugins.get_mut(provider) else {
@@ -1064,6 +1087,20 @@ impl Kernel {
             instance.next_id += 1;
             let (tx, rx) = oneshot::channel();
             instance.waiting.insert(id, tx);
+            let mut meta = json!({
+                "caller": caller,
+                // Only the kernel's own fields are written here; the caller's
+                // request identity and stream flag remain kernel-controlled.
+                "request_id": id,
+                "timeout_ms": timeout_ms,
+                "stream": stream_sid.is_some(),
+            });
+            if let Some(registration) = &registration {
+                meta["authorized_registration"] = json!({
+                    "service": registration.service,
+                    "capability": registration.capability,
+                });
+            }
             let frame = proto::request(
                 id,
                 method::INVOKE,
@@ -1071,14 +1108,7 @@ impl Kernel {
                     "capability": capability,
                     "method": method_name,
                     "params": params,
-                    "meta": {
-                        "caller": caller,
-                        // Only `caller` is the kernel's to write; everything else
-                        // the plugin sent is preserved.
-                        "request_id": id,
-                        "timeout_ms": timeout_ms,
-                        "stream": stream_sid.is_some(),
-                    },
+                    "meta": meta,
                 }),
             );
             instance.sink().send(&frame);
@@ -2069,7 +2099,9 @@ impl Kernel {
                             decl: Decl {
                                 id: id.clone(),
                                 provides: Vec::new(),
-                                requires: Vec::new(),
+                                injects: Vec::new(),
+                                registrations: Vec::new(),
+                                host_calls: Vec::new(),
                             },
                             view: Arc::new(RoutingTable::new()),
                             waiting: HashMap::new(),

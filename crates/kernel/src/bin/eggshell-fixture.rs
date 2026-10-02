@@ -5,7 +5,8 @@
 //!
 //!     eggshell-fixture --provides demo.text [options]
 //!
-//! Options: `--requires <capability>` (repeatable), `--chunks <n>`,
+//! Options: `--injects <capability>` (repeatable), `--register <service> <capability>`,
+//! `--host-call <capability>`, `--chunks <n>`,
 //! `--exit-on-start`, `--exit-on-invoke`, `--exit-if <path>`.
 
 use std::process::ExitCode;
@@ -21,7 +22,9 @@ const MAX_FRAME_BYTES: usize = 1 << 20;
 #[derive(Default)]
 struct Args {
     provides: Vec<String>,
-    requires: Vec<Value>,
+    injects: Vec<Value>,
+    registrations: Vec<Value>,
+    host_calls: Vec<String>,
     chunks: usize,
     exit_on_start: bool,
     exit_on_invoke: bool,
@@ -38,12 +41,25 @@ fn parse() -> Args {
                     args.provides.push(capability);
                 }
             }
-            "--requires" => {
+            "--injects" => {
                 if let Some(capability) = rest.next() {
-                    args.requires.push(json!({
+                    args.injects.push(json!({
                         "capability": capability,
                         "optional": false,
                     }));
+                }
+            }
+            "--register" => {
+                if let (Some(service), Some(capability)) = (rest.next(), rest.next()) {
+                    args.registrations.push(json!({
+                        "service": service,
+                        "capability": capability,
+                    }));
+                }
+            }
+            "--host-call" => {
+                if let Some(capability) = rest.next() {
+                    args.host_calls.push(capability);
                 }
             }
             "--chunks" => args.chunks = rest.next().and_then(|n| n.parse().ok()).unwrap_or(0),
@@ -100,7 +116,9 @@ async fn main() -> ExitCode {
                         let reply = json!({
                             "protocol": proto::PROTOCOL_VERSION,
                             "provides": args.provides,
-                            "requires": args.requires,
+                            "injects": args.injects,
+                            "registrations": args.registrations,
+                            "host_calls": args.host_calls,
                         });
                         send(&mut out, &proto::success(id, reply)).await;
                     }

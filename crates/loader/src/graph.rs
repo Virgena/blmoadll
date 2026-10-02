@@ -1,7 +1,7 @@
 //! Dependency graph.
 //!
 //! Two sources of truth must agree: the config maps capability slots to plugin
-//! ids, and each plugin declares what it provides and requires. Everything here
+//! ids, and each plugin declares what it provides, injects and registers. Everything here
 //! is pure so it can be unit tested without spawning anything.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,10 +18,18 @@ pub struct Req {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Registration {
+    pub service: String,
+    pub capability: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Decl {
     pub id: String,
     pub provides: Vec<String>,
-    pub requires: Vec<Req>,
+    pub injects: Vec<Req>,
+    pub registrations: Vec<Registration>,
+    pub host_calls: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +72,7 @@ pub struct Report {
     pub blocked: BTreeMap<String, Vec<String>>,
 }
 
-/// Reads `provides` / `requires` out of an `initialize` reply.
+/// Reads the v3 declaration out of an `initialize` reply.
 pub fn decl_from_initialize(id: &str, params: &Value) -> Result<Decl, Issue> {
     let provides_raw = params
         .get("provides")
@@ -75,13 +83,31 @@ pub fn decl_from_initialize(id: &str, params: &Value) -> Result<Decl, Issue> {
                 "initialize reply has no `provides` array",
             )
         })?;
-    let requires_raw = params
-        .get("requires")
+    let injects_raw = params
+        .get("injects")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             Issue::error(
                 codes::INVALID_PARAMS,
-                "initialize reply has no `requires` array",
+                "initialize reply has no `injects` array",
+            )
+        })?;
+    let registrations_raw = params
+        .get("registrations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Issue::error(
+                codes::INVALID_PARAMS,
+                "initialize reply has no `registrations` array",
+            )
+        })?;
+    let host_calls_raw = params
+        .get("host_calls")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            Issue::error(
+                codes::INVALID_PARAMS,
+                "initialize reply has no `host_calls` array",
             )
         })?;
 
@@ -96,18 +122,18 @@ pub fn decl_from_initialize(id: &str, params: &Value) -> Result<Decl, Issue> {
         provides.push(capability.to_string());
     }
 
-    let mut requires = Vec::new();
-    for item in requires_raw {
+    let mut injects = Vec::new();
+    for item in injects_raw {
         let capability = item
             .get("capability")
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 Issue::error(
                     codes::INVALID_PARAMS,
-                    "requires[] entry without `capability`",
+                    "injects[] entry without `capability`",
                 )
             })?;
-        requires.push(Req {
+        injects.push(Req {
             capability: capability.to_string(),
             optional: item
                 .get("optional")
@@ -116,10 +142,87 @@ pub fn decl_from_initialize(id: &str, params: &Value) -> Result<Decl, Issue> {
         });
     }
 
+    let mut registrations = Vec::new();
+    for item in registrations_raw {
+        let service = item.get("service").and_then(Value::as_str).ok_or_else(|| {
+            Issue::error(
+                codes::INVALID_PARAMS,
+                "registrations[] entry without `service`",
+            )
+        })?;
+        let capability = item
+            .get("capability")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Issue::error(
+                    codes::INVALID_PARAMS,
+                    "registrations[] entry without `capability`",
+                )
+            })?;
+        registrations.push(Registration {
+            service: service.to_string(),
+            capability: capability.to_string(),
+        });
+    }
+
+    let mut host_calls = Vec::new();
+    for item in host_calls_raw {
+        let capability = item.as_str().ok_or_else(|| {
+            Issue::error(
+                codes::INVALID_PARAMS,
+                "host_calls[] entry must be a capability id",
+            )
+        })?;
+        host_calls.push(capability.to_string());
+    }
+
+    for registration in &registrations {
+        if registration.service == registration.capability {
+            return Err(Issue::error(
+                codes::INVALID_PARAMS,
+                format!(
+                    "`{id}` registers `{}` into itself; service and capability must differ",
+                    registration.capability
+                ),
+            ));
+        }
+        if !provides.contains(&registration.capability) {
+            return Err(Issue::error(
+                codes::INVALID_PARAMS,
+                format!(
+                    "`{id}` registers `{}`, which is not in its `provides`",
+                    registration.capability
+                ),
+            ));
+        }
+    }
+    for capability in &host_calls {
+        if !provides.contains(capability) {
+            return Err(Issue::error(
+                codes::INVALID_PARAMS,
+                format!("`{id}` exposes `{capability}` to the host, but does not provide it"),
+            ));
+        }
+    }
+    let mut registered = BTreeSet::new();
+    for registration in &registrations {
+        if !registered.insert(registration.capability.as_str()) {
+            return Err(Issue::error(
+                codes::INVALID_PARAMS,
+                format!(
+                    "`{id}` registers `{}` more than once",
+                    registration.capability
+                ),
+            ));
+        }
+    }
+
     Ok(Decl {
         id: id.to_string(),
         provides,
-        requires,
+        injects,
+        registrations,
+        host_calls,
     })
 }
 
@@ -163,11 +266,19 @@ pub fn validate(
             .iter()
             .filter_map(|decl| {
                 let missing: Vec<String> = decl
-                    .requires
+                    .injects
                     .iter()
                     .filter(|req| !req.optional)
                     .filter(|req| !serves(&report.table, req))
                     .map(|req| req.capability.clone())
+                    .chain(
+                        decl.registrations
+                            .iter()
+                            .filter(|registration| {
+                                !report.table.contains_key(&registration.service)
+                            })
+                            .map(|registration| registration.service.clone()),
+                    )
                     .collect();
                 if missing.is_empty() {
                     None
@@ -308,7 +419,7 @@ fn build_table(
 
     let mut used: BTreeSet<String> = BTreeSet::new();
     for decl in active {
-        for req in &decl.requires {
+        for req in &decl.injects {
             if serves(&report.table, req) {
                 used.insert(req.capability.clone());
                 continue;
@@ -317,19 +428,22 @@ fn build_table(
                 continue;
             }
             report.warnings.push(Issue::warning(format!(
-                "optional dependency skipped: `{}` requires `{}` but no provider is configured{}",
+                "optional injection skipped: `{}` injects `{}` but no provider is configured{}",
                 decl.id,
                 req.capability,
                 closest(&req.capability, report.table.keys().map(String::as_str))
             )));
         }
+        for registration in &decl.registrations {
+            used.insert(registration.capability.clone());
+        }
+        used.extend(decl.host_calls.iter().cloned());
     }
 
     for slot in report.table.keys() {
         if !used.contains(slot) {
             report.warnings.push(Issue::warning(format!(
-                "capability slot `{slot}` is configured but no plugin requires it \
-                 (expected when the host is the only caller)"
+                "capability slot `{slot}` is configured but no plugin injects, registers or host-calls it"
             )));
         }
     }
@@ -344,8 +458,17 @@ pub fn start_order(decls: &[Decl], table: &RoutingTable) -> Result<Vec<String>, 
     let mut dependents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for decl in decls {
-        for req in &decl.requires {
-            let Some(route) = table.get(&req.capability) else {
+        let dependencies = decl
+            .injects
+            .iter()
+            .map(|req| req.capability.as_str())
+            .chain(
+                decl.registrations
+                    .iter()
+                    .map(|registration| registration.service.as_str()),
+            );
+        for dependency in dependencies {
+            let Some(route) = table.get(dependency) else {
                 continue;
             };
             if route.plugin == decl.id {
@@ -456,17 +579,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn decl(id: &str, provides: &[&str], requires: &[(&str, bool)]) -> Decl {
+    fn decl(id: &str, provides: &[&str], injects: &[(&str, bool)]) -> Decl {
         Decl {
             id: id.to_string(),
             provides: provides.iter().map(|c| c.to_string()).collect(),
-            requires: requires
+            injects: injects
                 .iter()
                 .map(|(c, o)| Req {
                     capability: c.to_string(),
                     optional: *o,
                 })
                 .collect(),
+            registrations: Vec::new(),
+            host_calls: Vec::new(),
         }
     }
 
@@ -489,28 +614,112 @@ mod tests {
     #[test]
     fn reads_declarations_from_an_initialize_reply() {
         let params = json!({
-            "protocol": 1,
+            "protocol": 3,
             "provides": ["demo.text"],
-            "requires": [
+            "injects": [
                 {"capability": "demo.store"},
                 {"capability": "demo.tools", "optional": true},
             ],
+            "registrations": [{"service": "demo.tools", "capability": "demo.text"}],
+            "host_calls": ["demo.text"],
         });
         let parsed = decl_from_initialize("consumer", &params).unwrap();
         assert_eq!(parsed.provides, vec!["demo.text".to_string()]);
-        assert_eq!(parsed.requires[0].capability, "demo.store");
-        assert_eq!(parsed.requires[0].optional, false);
-        assert_eq!(parsed.requires[1].optional, true);
+        assert_eq!(parsed.injects[0].capability, "demo.store");
+        assert_eq!(parsed.injects[0].optional, false);
+        assert_eq!(parsed.injects[1].optional, true);
+        assert_eq!(parsed.registrations[0].service, "demo.tools");
+        assert_eq!(parsed.registrations[0].capability, "demo.text");
+        assert_eq!(parsed.host_calls, vec!["demo.text".to_string()]);
 
-        assert!(decl_from_initialize("x", &json!({"provides": []})).is_err());
-        assert!(decl_from_initialize("x", &json!({"provides": [7], "requires": []})).is_err());
         assert!(
             decl_from_initialize(
                 "x",
-                &json!({"provides": [], "requires": [{"optional": true}]})
+                &json!({"provides": [], "registrations": [], "host_calls": []})
             )
             .is_err()
         );
+        assert!(
+            decl_from_initialize(
+                "x",
+                &json!({"provides": [], "injects": [], "host_calls": []})
+            )
+            .is_err()
+        );
+        assert!(
+            decl_from_initialize(
+                "x",
+                &json!({"provides": [], "injects": [], "registrations": []})
+            )
+            .is_err()
+        );
+        assert!(
+            decl_from_initialize(
+                "x",
+                &json!({"provides": [7], "injects": [], "registrations": [], "host_calls": []})
+            )
+            .is_err()
+        );
+        assert!(
+            decl_from_initialize(
+                "x",
+                &json!({"provides": [], "injects": [{"optional": true}], "registrations": [], "host_calls": []})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn registration_consumes_the_capability_and_orders_the_service_first() {
+        let mut provider = decl("provider", &["demo.item"], &[]);
+        provider.registrations = vec![Registration {
+            service: "demo.registry".to_string(),
+            capability: "demo.item".to_string(),
+        }];
+        let registry = decl("registry", &["demo.registry"], &[]);
+        let report = check(&[provider.clone(), registry.clone()], &BTreeMap::new());
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("demo.item")),
+            "{report:?}"
+        );
+        assert_eq!(
+            start_order(&[provider, registry], &report.table).unwrap(),
+            vec!["registry", "provider"]
+        );
+    }
+
+    #[test]
+    fn host_calls_consume_a_capability_without_a_dependency() {
+        let mut provider = decl("provider", &["demo.web"], &[]);
+        provider.host_calls = vec!["demo.web".to_string()];
+        let report = check(&[provider], &BTreeMap::new());
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.message.contains("demo.web")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_registration_service_nobody_serves_blocks_the_provider() {
+        let mut provider = decl("provider", &["demo.item"], &[]);
+        provider.registrations = vec![Registration {
+            service: "demo.registry".to_string(),
+            capability: "demo.item".to_string(),
+        }];
+        let report = check(&[provider], &BTreeMap::new());
+        assert_eq!(
+            report.blocked["provider"],
+            vec!["demo.registry".to_string()]
+        );
+        assert!(report.table.is_empty(), "{report:?}");
     }
 
     #[test]
@@ -592,7 +801,7 @@ mod tests {
             report
                 .warnings
                 .iter()
-                .any(|w| w.message.contains("optional dependency skipped")),
+                .any(|w| w.message.contains("optional injection skipped")),
             "{report:?}"
         );
     }

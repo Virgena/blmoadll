@@ -9,7 +9,7 @@ pub mod frame;
 pub mod msg;
 
 /// Protocol version carried by `initialize`. A mismatch is `-32015`.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// JSON-RPC method names of the kernel <-> plugin protocol.
 pub mod method {

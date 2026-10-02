@@ -30,7 +30,7 @@ Content-Length: 78\r\n
 One complete round:
 
 ```
-kernel -> you   initialize   you reply {protocol, provides, requires}
+kernel -> you   initialize   you reply {protocol, provides, injects, registrations, host_calls}
 kernel -> you   start        you reply {}
 kernel -> you   invoke       you reply with a result (or {stream_id})   <- your actual work
                 both ways: $/stream/chunk, $/event, $/io/data
@@ -141,7 +141,7 @@ The kernel sends it as soon as the process is up. params:
 
 ```json
 {
-  "protocol": 2,
+  "protocol": 3,
   "plugin_id": "provider",
   "kernel_version": "0.1.0",
   "config": {"prefix": "echo: "}
@@ -150,7 +150,7 @@ The kernel sends it as soon as the process is up. params:
 
 | field | meaning |
 |---|---|
-| `protocol` | the kernel's protocol version, currently 2 |
+| `protocol` | the kernel's protocol version, currently 3 |
 | `plugin_id` | the id you have in the config file |
 | `kernel_version` | the version string of the kernel crate, for logs and diagnostics only |
 | `config` | the verbatim JSON of the `[plugins.<id>.config]` table in the config file; `{}` when absent |
@@ -165,23 +165,27 @@ result must contain:
 
 ```json
 {
-  "protocol": 2,
+  "protocol": 3,
   "provides": ["demo.text"],
-  "requires": [{"capability": "demo.tools", "optional": true}]
+  "injects": [{"capability": "demo.tools", "optional": true}],
+  "registrations": [{"service": "demo.registry", "capability": "demo.text"}],
+  "host_calls": ["demo.text"]
 }
 ```
 
 | field | required | notes |
 |---|---|---|
-| `protocol` | yes | must equal 2. Anything else is -32015, the kernel startup fails, and it says "you claim protocol N, the kernel says 2" |
+| `protocol` | yes | must equal 3. Anything else is -32015, the kernel startup fails, and it says "you claim protocol N, the kernel says 3" |
 | `provides` | yes | array of capability ids (strings) |
-| `requires` | yes | array of objects. Every entry needs `capability`; `optional` defaults to false |
+| `injects` | yes | array of objects. Every entry needs `capability`; `optional` defaults to false |
+| `registrations` | yes | array of `{service, capability}` objects. `capability` must be in `provides`; the service is a hard dependency and starts first |
+| `host_calls` | yes | array of capability ids the embedding host calls directly. Each id must be in `provides` |
 
-- Missing either `provides` or `requires` is an error (the messages are "initialize reply has no `provides` array" / "no `requires` array").
-- A `optional: true` dependency with no provider only logs a warning and is skipped (it does not block startup); a required dependency that is missing or that forms a cycle fails startup.
-- Other fields in result are ignored. The kernel builds the routing table and the topological order from `provides` / `requires` alone.
+- Missing any of `provides`, `injects`, `registrations` or `host_calls` is an error.
+- An `optional: true` injection with no provider only logs a warning and is skipped (it does not block startup); a required injection or registration service that is missing, and any dependency cycle, blocks startup.
+- Other fields in result are ignored. The kernel builds the routing table and topological order from `provides`, `injects` and `registrations`; `host_calls` only records host consumption.
 
-The dependency semantics are worth stating plainly: `requires` says "I need another capability to exist". It decides **startup order** (your start is called after the start of what you depend on) and does not prevent you from calling any capability at runtime; runtime calls are bounded by the routing table only.
+The dependency semantics are worth stating plainly: `injects` says "I need another capability to exist", and `registrations` says "I publish this provided capability into that service". Both decide **startup order** (the dependency or service starts first) and do not otherwise restrict runtime calls. A capability listed in `host_calls` is marked as consumed by the host without adding a dependency.
 
 ### 3.2 start (request, must be answered)
 
@@ -222,6 +226,11 @@ params:
 | `request_id` | the kernel's call number on this pipe, a **number**. It matches your `$/cancel` notifications |
 | `timeout_ms` | the timeout the kernel already set for this call; after it the caller gets -32012 and you get `$/cancel` |
 | `stream` | true means a streaming call, see section 7 |
+
+When the call goes to a service's `register` or `unregister` method, the kernel also adds
+`meta.authorized_registration: {service, capability}` after matching `params.capability`
+against the caller's `registrations` declaration. Registry implementations use this
+kernel-written marker instead of trusting a caller-supplied owner or a stale routing snapshot.
 
 `"host"` is a reserved label: it stands for the host embedding the kernel (an editor or an application). The host is a **pure caller**: it provides no capabilities, has no process, and cannot be a routing target. Defining `plugins.host` in the config file is rejected.
 
@@ -404,7 +413,7 @@ kernel                                        plugin process
  │ ──────────────────────────────────────────► │  up, starts reading fd 0
  │                                             │
  │  initialize {protocol,plugin_id,config} ──► │
- │ ◄──────────────── {protocol,provides,requires}
+ │ ◄──────────────── {protocol,provides,injects,registrations,host_calls}
  │                                             │
  │  (validate the dependency graph + order it; │
  │   any error fails the whole startup)        │
@@ -644,7 +653,7 @@ When a host `subscribe` carries `replay: true`, the kernel sends one `kernel.plu
 
 When a config file change is accepted (at any layer, see §12.4), the kernel emits `kernel.capabilities.changed` (with the whole new table) and `kernel.config.reloaded`. **The kernel itself does not restart** during a reload: added or changed plugins are brought up and go through `initialize` + `start` again, while replaced plugins are drained and then get `shutdown{reason:"reload"}`. A failed reload (the new config is broken) is rolled back as a whole and the old config keeps running; you only see a log line, no event.
 
-A reload can also leave a plugin without something it requires: if the provider is gone (disabled, or no longer declaring the slot), the consumer is stopped (its `kernel.plugin.stopped` carries `trigger: config`) and enters the waiting state of §6, and the reload that brings the provider back starts the consumer again. A `restart` whose plugin lands in the waiting state still answers `{}`; `kernel.plugin.blocked` is what says what it is waiting for. A restart **stops first, then starts**: the old instance goes down cleanly through `shutdown{reason:"reload"}` and is waited for. Past that plugin's `shutdown_grace_ms` it is killed, and if it still refuses to leave the restart is rejected with -32011. Then the same bring-up pipeline a reload uses runs: spawn, `initialize`, validate the whole graph, swap the table, `start`, and finally another `kernel.capabilities.changed`. Stopping first is because things like ports exist once: the web plugin binds 8341 by default, and starting the new instance first would only hit EADDRINUSE.
+A reload can also leave a plugin without something it injects or a service it registers with: if the provider is gone (disabled, or no longer declaring the slot), the consumer is stopped (its `kernel.plugin.stopped` carries `trigger: config`) and enters the waiting state of §6, and the reload that brings the provider back starts the consumer again. A `restart` whose plugin lands in the waiting state still answers `{}`; `kernel.plugin.blocked` is what says what it is waiting for. A restart **stops first, then starts**: the old instance goes down cleanly through `shutdown{reason:"reload"}` and is waited for. Past that plugin's `shutdown_grace_ms` it is killed, and if it still refuses to leave the restart is rejected with -32011. Then the same bring-up pipeline a reload uses runs: spawn, `initialize`, validate the whole graph, swap the table, `start`, and finally another `kernel.capabilities.changed`. Stopping first is because things like ports exist once: the web plugin binds 8341 by default, and starting the new instance first would only hit EADDRINUSE.
 
 After a successful restart the new instance has a new pid, and the `trigger` on both `kernel.plugin.started` and `kernel.plugin.stopped` records who asked. The plugin itself still sees `reload`. If the new instance cannot come up, that plugin stays absent, capability calls get -32011 (`data.plugin` names it), the log carries one `restart rejected: ...` line, and another `restart` retries. A restart touches only the plugin named, so other plugins never even see the routing table move.
 
@@ -717,7 +726,7 @@ The five standard JSON-RPC codes are reused verbatim; the rest are eggshellmod's
 | -32020 | `payload_too_large` | the payload is past its ceiling (an event or `kernel.write`) |
 | -32021 | `unknown_subscription` | unknown subscription id |
 
--32602 shows up in these places: a `kernel.invoke` missing the string `meta.request_id`, an `initialize` reply missing `provides`/`requires`, an empty subscription `patterns`, an io `stream` that is neither `stdin` nor `stdout`, a `kernel.write` whose `stream` is not `stdout`, an ill-formed `kernel.unsubscribe` id, a `kernel.publish` using the `kernel.` prefix, and a host `shutdown` whose `reason` is not one of the two allowed values.
+-32602 shows up in these places: a `kernel.invoke` missing the string `meta.request_id`, an `initialize` reply missing a required declaration array, an empty subscription `patterns`, an io `stream` that is neither `stdin` nor `stdout`, a `kernel.write` whose `stream` is not `stdout`, an ill-formed `kernel.unsubscribe` id, a `kernel.publish` using the `kernel.` prefix, and a host `shutdown` whose `reason` is not one of the two allowed values.
 
 Three notes:
 
@@ -811,7 +820,9 @@ greeting = "hi"
 import { writeSync } from "node:fs";
 
 const provides = ["demo.text"];
-const requires: { capability: string; optional?: boolean }[] = [];
+const injects: { capability: string; optional?: boolean }[] = [];
+const registrations: { service: string; capability: string }[] = [];
+const host_calls: string[] = [];
 
 function send(message: unknown): void {
   const body = Buffer.from(JSON.stringify(message), "utf8");
@@ -853,7 +864,7 @@ function handle(message: any): void {
   switch (method) {
     case "initialize":
       send({ jsonrpc: "2.0", id,
-             result: { protocol: 2, provides, requires } });
+             result: { protocol: 3, provides, injects, registrations, host_calls } });
       return;
 
     case "start":
@@ -941,7 +952,7 @@ extends = ["eggshell.base.toml", "team.toml"]   # loaded first, in this order
 
 ## 13. Version and compatibility
 
-- `PROTOCOL_VERSION` is currently 2.
+- `PROTOCOL_VERSION` is currently 3.
 - The version is negotiated through `initialize`'s `params.protocol` / `result.protocol`; a mismatch on either side is -32015, which fails startup and reports both versions explicitly.
 - Any incompatible wire change bumps it. **Adding an optional field is not incompatible** (the kernel ignores fields it does not know), while removing a field or changing its semantics is.
 - `kernel_version` is diagnostic only; do not gate features on it. Gate on `protocol`.

@@ -137,7 +137,7 @@ pub struct Config {
     ///
     /// Routing is derived from each plugin's own `provides`, so this is only
     /// needed to break a tie when two configured plugins offer the same
-    /// capability. Slots nobody requires are allowed.
+    /// capability. Slots nobody injects, registers or host-calls are allowed.
     pub capability: BTreeMap<String, String>,
     /// Plugin ids whose merged row says `disabled = true`. They are not in
     /// `plugins`, but a `[capability]` pin or a report can still name them.
