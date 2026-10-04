@@ -1,4 +1,4 @@
-//! JSON-RPC error codes: the standard five plus the eggshellmod block.
+//! JSON-RPC error codes: the standard five plus the blmoadll block.
 
 // JSON-RPC 2.0 standard codes, reused as-is.
 pub const PARSE_ERROR: i64 = -32700;
@@ -7,7 +7,7 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
 
-// eggshellmod codes.
+// blmoadll codes.
 pub const UNKNOWN_CAPABILITY: i64 = -32010;
 /// Provider unavailable / already exited. In `--check` this means the plugin
 /// exited unexpectedly after answering `initialize`.

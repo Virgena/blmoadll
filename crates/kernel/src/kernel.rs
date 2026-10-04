@@ -1821,7 +1821,7 @@ impl Kernel {
 
     pub fn serve(self: Arc<Self>) {
         // stdin comes up only when somebody attaches; until then the OS keeps the
-        // pipe's bytes, so `echo hi | eggshell run` loses nothing.
+        // pipe's bytes, so `echo hi | blmoadll run` loses nothing.
         let chunk = self.cfg().io_line_bytes;
         io::start_stdin(self.clone(), self.attached.subscribe(), chunk);
 

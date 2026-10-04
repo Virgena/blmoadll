@@ -1,4 +1,4 @@
-# The eggshellmod wire protocol
+# The blmoadll wire protocol
 
 This document is for people who write plugins, especially plugins in TypeScript. After reading it you can write a plugin that loads, answers calls, streams, exchanges events, reads and writes the terminal, and shuts down cleanly, without reading any Rust. The other side, a host that runs the kernel as a child process and writes no plugins, is section 14.
 
@@ -704,7 +704,7 @@ The kernel's slogan is "load, unload, dependencies, and nothing more". But **mul
 
 ## 10. Error code table
 
-The five standard JSON-RPC codes are reused verbatim; the rest are eggshellmod's own block.
+The five standard JSON-RPC codes are reused verbatim; the rest are blmoadll's own block.
 
 | code | name | meaning |
 |---|---|---|
@@ -816,7 +816,7 @@ greeting = "hi"
 
 ```ts
 #!/usr/bin/env node
-// An eggshell plugin written with Node: speaking the protocol is all it takes.
+// A blmoadll plugin written with Node: speaking the protocol is all it takes.
 import { writeSync } from "node:fs";
 
 const provides = ["demo.text"];
@@ -911,7 +911,7 @@ command = "node"
 args = ["minimal-plugin.mjs"]
 ```
 
-The stand-in plugin the kernel tests use (`crates/kernel/src/bin/eggshell-fixture.rs`, Rust) has this shape in another language; read it whenever something is unclear.
+The stand-in plugin the kernel tests use (`crates/kernel/src/bin/blmoadll-fixture.rs`, Rust) has this shape in another language; read it whenever something is unclear.
 
 ### 12.3 A self-check list
 
@@ -931,7 +931,7 @@ Go through this before shipping:
 A config file can list, with `extends`, the files it layers on top of:
 
 ```toml
-extends = ["eggshell.base.toml", "team.toml"]   # loaded first, in this order
+extends = ["blmoadll.base.toml", "team.toml"]   # loaded first, in this order
 ```
 
 - **Every listed file must exist.** A missing one fails startup and names the file that could not be read, so a typo in a filename is visible immediately instead of degrading into "one layer short but looking fine".
@@ -942,7 +942,7 @@ extends = ["eggshell.base.toml", "team.toml"]   # loaded first, in this order
 - `--check` prints which files this run is made of, base layers first and the entry last:
 
   ```
-  config: eggshell.toml + eggshell.local.toml
+  config: blmoadll.toml + blmoadll.local.toml
   ```
 
 - Hot reload watches **the whole stack**: editing a file named by the entry's `extends` triggers a reload exactly like editing the entry itself.
@@ -970,7 +970,7 @@ Upward the kernel is just another plugin-shaped program: the host starts it and 
 ### 14.1 How to start it
 
 ```
-eggshell <config.toml> [--check] [--json]
+blmoadll <config.toml> [--check] [--json]
 ```
 
 This executable is only produced by a `--features host` build. A default build produces no executables at all (apart from the test stand-in, see 12.2).
@@ -1063,7 +1063,7 @@ This is the whole shape, no other magic: spawn a process, frame by `Content-Leng
 ```ts
 import { spawn } from "node:child_process";
 
-const kernel = spawn("eggshell", ["./eggshell.toml"], { stdio: ["pipe", "pipe", "inherit"] });
+const kernel = spawn("blmoadll", ["./blmoadll.toml"], { stdio: ["pipe", "pipe", "inherit"] });
 
 let buffer = Buffer.alloc(0);
 kernel.stdout.on("data", (chunk) => {

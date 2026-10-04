@@ -1,1 +1,3 @@
-A plugin core with an unstable API that is subject to change at any time.
+# blmoadll
+
+A plugin kernel for Node hosts. The API is unstable and may change at any time.

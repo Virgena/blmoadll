@@ -1,4 +1,4 @@
-//! eggshellmod wire protocol.
+//! blmoadll wire protocol.
 //!
 //! Two directions share one pipe: the kernel speaks JSON-RPC 2.0 to a plugin
 //! process over its stdin/stdout, framed LSP-style with `Content-Length`.

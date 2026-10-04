@@ -1,4 +1,4 @@
-//! eggshellmod kernel.
+//! blmoadll kernel.
 //!
 //! It spawns and supervises plugin processes, routes capability calls between
 //! them, relays events, multiplexes the terminal, hot reloads and shuts down.

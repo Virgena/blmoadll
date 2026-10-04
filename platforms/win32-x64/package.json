@@ -1,0 +1,23 @@
+{
+  "name": "@virgena/blmoadll-win32-x64",
+  "version": "0.1.0",
+  "description": "Windows x64 binaries for @virgena/blmoadll.",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/blmoadll.exe",
+    "bin/blmoadll-fixture.exe"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Virgena/blmoadll.git"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

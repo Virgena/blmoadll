@@ -1,2 +1,4 @@
 target/
-npm/bin/
+bin/
+platforms/*/bin/
+artifacts/

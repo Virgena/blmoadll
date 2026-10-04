@@ -1,0 +1,46 @@
+{
+  "name": "@virgena/blmoadll",
+  "version": "0.1.0",
+  "description": "blmoadll kernel binaries: blmoadll (host) + blmoadll-fixture (proxy plugin), for use with the Node host.",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "blmoadll": "bin.js",
+    "blmoadll-fixture": "bin-fixture.js"
+  },
+  "files": [
+    "bin.js",
+    "bin-fixture.js",
+    "index.js",
+    "index.d.ts",
+    "install.js",
+    "docs/PROTOCOL.md"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "scripts": {
+    "build:bin": "node install.js",
+    "prepack": "node install.js --stage platforms/win32-x64/bin",
+    "test:pack": "node scripts/verify-pack.mjs"
+  },
+  "optionalDependencies": {
+    "@virgena/blmoadll-win32-x64": "0.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Virgena/blmoadll.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Virgena/blmoadll/issues"
+  },
+  "homepage": "https://github.com/Virgena/blmoadll#readme",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

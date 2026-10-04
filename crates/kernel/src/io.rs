@@ -63,7 +63,7 @@ where
 
 /// Reads the kernel's stdin, but only while some plugin owns it. Nothing is
 /// read before the first `attach`, so piped input waits in the OS buffer and
-/// `echo hi | eggshell run` loses nothing.
+/// `echo hi | blmoadll run` loses nothing.
 pub fn start_stdin(kernel: Arc<Kernel>, attached: watch::Receiver<bool>, chunk: usize) {
     tokio::spawn(async move {
         let mut attached = attached;

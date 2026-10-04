@@ -11,10 +11,10 @@ use serde_json::{Value, json};
 use kernel::{Host, Kernel};
 use loader::Config;
 
-const FIXTURE: &str = env!("CARGO_BIN_EXE_eggshell-fixture");
+const FIXTURE: &str = env!("CARGO_BIN_EXE_blmoadll-fixture");
 
 fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("eggshell-{name}-{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("blmoadll-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).expect("scratch dir");
     path
@@ -23,7 +23,7 @@ fn scratch(name: &str) -> PathBuf {
 /// The fixture path goes in a TOML literal string: on Windows it is full of
 /// backslashes, and a basic string would treat them as escapes.
 fn config(dir: &Path, body: &str) -> PathBuf {
-    let path = dir.join("eggshell.toml");
+    let path = dir.join("blmoadll.toml");
     std::fs::write(&path, body).expect("write config");
     path
 }

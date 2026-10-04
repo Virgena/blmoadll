@@ -1,7 +1,7 @@
 //! Host-process tests: the kernel as a subprocess, driven the way a
 //! TypeScript host drives it.
 //!
-//! `eggshell <config.toml>` speaks the same framing on fd 0/1 that a plugin
+//! `blmoadll <config.toml>` speaks the same framing on fd 0/1 that a plugin
 //! speaks. Nothing here touches the Rust API: spawn it, frame it, read it.
 //!
 //! Needs the test double and the host binary: `--features fixture,host`.
@@ -17,8 +17,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use protocol::{read_frame, write_frame};
 
-const EGGSHELL: &str = env!("CARGO_BIN_EXE_eggshell");
-const FIXTURE: &str = env!("CARGO_BIN_EXE_eggshell-fixture");
+const BLMOADLL: &str = env!("CARGO_BIN_EXE_blmoadll");
+const FIXTURE: &str = env!("CARGO_BIN_EXE_blmoadll-fixture");
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const PATIENCE: Duration = Duration::from_secs(15);
 /// The reloader polls on its own interval, so a propagated change is an
@@ -26,7 +26,7 @@ const PATIENCE: Duration = Duration::from_secs(15);
 const RELOAD_PATIENCE: Duration = Duration::from_secs(60);
 
 fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("eggshell-pipe-{name}-{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!("blmoadll-pipe-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).expect("scratch dir");
     path
@@ -35,7 +35,7 @@ fn scratch(name: &str) -> PathBuf {
 /// The fixture path goes in a TOML literal string: on Windows it is full of
 /// backslashes, and a basic string would treat them as escapes.
 fn config(dir: &Path, body: &str) -> PathBuf {
-    let path = dir.join("eggshell.toml");
+    let path = dir.join("blmoadll.toml");
     std::fs::write(&path, body).expect("write config");
     path
 }
@@ -71,7 +71,7 @@ impl Drop for HostProcess {
 
 impl HostProcess {
     async fn spawn(path: &Path) -> HostProcess {
-        let mut child = Command::new(EGGSHELL)
+        let mut child = Command::new(BLMOADLL)
             .arg(path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -377,7 +377,7 @@ args = ["--provides", "demo.text"]
 "#
         ),
     );
-    let output = Command::new(EGGSHELL)
+    let output = Command::new(BLMOADLL)
         .arg(&path)
         .stdin(Stdio::null())
         .output()
@@ -488,7 +488,7 @@ async fn check_prints_a_report_on_stdout_and_never_sends_start() {
     // so a check that passes proves `start` was never sent.
     let path = config(&dir, &one_provider("demo.text", r#", "--exit-on-start""#));
 
-    let output = Command::new(EGGSHELL)
+    let output = Command::new(BLMOADLL)
         .arg(&path)
         .args(["--check", "--json"])
         .output()
@@ -528,7 +528,7 @@ args = ["--provides", "demo.text"]
         ),
     );
 
-    let output = Command::new(EGGSHELL)
+    let output = Command::new(BLMOADLL)
         .arg(&path)
         .arg("--check")
         .output()
@@ -573,7 +573,7 @@ args = ["--provides", "demo.more"]
     )
     .expect("write the entry layer");
 
-    let output = Command::new(EGGSHELL)
+    let output = Command::new(BLMOADLL)
         .arg(&local)
         .args(["--check", "--json"])
         .output()
@@ -712,7 +712,7 @@ args = ["--provides", "demo.more"]
 #[tokio::test]
 async fn a_disabled_row_waits_for_the_config_to_enable_it() {
     let dir = scratch("disabled");
-    let path = dir.join("eggshell.toml");
+    let path = dir.join("blmoadll.toml");
     let body = |disabled: &str| {
         format!(
             r#"
@@ -802,7 +802,7 @@ async fn restart_brings_a_plugin_back_under_a_new_pid() {
     let command = started["params"]["payload"]["command"]
         .as_str()
         .unwrap_or_default();
-    assert!(command.contains("eggshell-fixture"), "{started}");
+    assert!(command.contains("blmoadll-fixture"), "{started}");
     assert_eq!(
         started["params"]["payload"]["args"],
         json!(["--provides", "demo.text"])
@@ -857,7 +857,7 @@ async fn a_late_subscriber_can_ask_for_the_running_plugins() {
     let command = started["params"]["payload"]["command"]
         .as_str()
         .unwrap_or_default();
-    assert!(command.contains("eggshell-fixture"), "{started}");
+    assert!(command.contains("blmoadll-fixture"), "{started}");
     assert_eq!(
         started["params"]["payload"]["args"],
         json!(["--provides", "demo.text"])
@@ -990,7 +990,7 @@ args = ["--provides", "demo.wait", "--injects", "demo.text"]
 #[tokio::test]
 async fn a_disabled_provider_leaves_its_consumer_waiting() {
     let dir = scratch("waiting-boot");
-    let path = dir.join("eggshell.toml");
+    let path = dir.join("blmoadll.toml");
     std::fs::write(&path, waiting_pair().replace("{disabled}", "true")).expect("write the config");
 
     let mut kernel = HostProcess::spawn(&path).await;
@@ -1057,7 +1057,7 @@ async fn a_disabled_provider_leaves_its_consumer_waiting() {
 #[tokio::test]
 async fn disabling_a_provider_drains_its_consumer() {
     let dir = scratch("waiting-drain");
-    let path = dir.join("eggshell.toml");
+    let path = dir.join("blmoadll.toml");
     std::fs::write(&path, waiting_pair().replace("{disabled}", "false")).expect("write the config");
 
     let mut kernel = HostProcess::spawn(&path).await;
@@ -1169,10 +1169,10 @@ args = ["--provides", "demo.text"]
 #[tokio::test]
 async fn check_reports_disabled_and_waiting_rows_and_still_exits_zero() {
     let dir = scratch("waiting-check");
-    let path = dir.join("eggshell.toml");
+    let path = dir.join("blmoadll.toml");
     std::fs::write(&path, waiting_pair().replace("{disabled}", "true")).expect("write the config");
 
-    let output = Command::new(EGGSHELL)
+    let output = Command::new(BLMOADLL)
         .arg(&path)
         .arg("--check")
         .output()
@@ -1189,7 +1189,7 @@ async fn check_reports_disabled_and_waiting_rows_and_still_exits_zero() {
 #[tokio::test]
 async fn editing_a_plugin_row_brings_it_back() {
     let dir = scratch("row-edit");
-    let path = dir.join("eggshell.toml");
+    let path = dir.join("blmoadll.toml");
     let body = |marker: &str| {
         format!(
             r#"

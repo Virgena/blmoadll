@@ -2,7 +2,7 @@
 name = "kernel"
 version.workspace = true
 edition.workspace = true
-description = "eggshellmod kernel: plugin processes, capability routing, events, hot reload"
+description = "blmoadll kernel: plugin processes, capability routing, events, hot reload"
 
 [dependencies]
 serde_json.workspace = true
@@ -19,8 +19,8 @@ fixture = []
 host = []
 
 [[bin]]
-name = "eggshell-fixture"
-path = "src/bin/eggshell-fixture.rs"
+name = "blmoadll-fixture"
+path = "src/bin/blmoadll-fixture.rs"
 required-features = ["fixture"]
 
 [[test]]
@@ -29,8 +29,8 @@ path = "tests/host.rs"
 required-features = ["fixture"]
 
 [[bin]]
-name = "eggshell"
-path = "src/bin/eggshell.rs"
+name = "blmoadll"
+path = "src/bin/blmoadll.rs"
 required-features = ["host"]
 
 [[test]]

@@ -2,7 +2,7 @@
 name = "protocol"
 version.workspace = true
 edition.workspace = true
-description = "Wire protocol for eggshellmod: Content-Length framing + JSON-RPC 2.0 message types"
+description = "Wire protocol for blmoadll: Content-Length framing + JSON-RPC 2.0 message types"
 
 [dependencies]
 serde_json.workspace = true

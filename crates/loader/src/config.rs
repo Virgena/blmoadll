@@ -7,7 +7,7 @@
 //! A config file may name the files it builds on:
 //!
 //! ```toml
-//! extends = ["eggshell.base.toml", "team.toml"]   # loaded first, in order
+//! extends = ["blmoadll.base.toml", "team.toml"]   # loaded first, in order
 //! ```
 //!
 //! Every file named must exist and is read from disk. Later layers win: the
@@ -17,7 +17,7 @@
 //! therefore be a single key:
 //!
 //! ```toml
-//! extends = ["eggshell.toml"]
+//! extends = ["blmoadll.toml"]
 //!
 //! [plugins.api.config]
 //! model = "deepseek-reasoner"
@@ -587,7 +587,7 @@ mod tests {
 request_timeout_ms = 1234
 
 [plugins.provider]
-command = "../target/debug/eggshell-plugin-example"
+command = "../target/debug/blmoadll-plugin-example"
 args = ["--prefix", "${PREFIX}"]
 env = { API_KEY = "${TOKEN}" }
 cwd = "sub"
@@ -602,7 +602,7 @@ prefix = "echo: "
 "#;
 
     fn sample(env: &dyn Fn(&str) -> Option<String>) -> Config {
-        Config::parse(SAMPLE, Path::new("/tmp/proj/eggshell.toml"), env).unwrap()
+        Config::parse(SAMPLE, Path::new("/tmp/proj/blmoadll.toml"), env).unwrap()
     }
 
     #[test]
@@ -630,12 +630,12 @@ prefix = "echo: "
         assert_eq!(plugin.cwd, config.dir.join("sub"));
         assert_eq!(
             plugin.command,
-            config.dir.join("../target/debug/eggshell-plugin-example")
+            config.dir.join("../target/debug/blmoadll-plugin-example")
         );
 
         let bare = Config::parse(
             "[plugins.p]\ncommand = \"my-plugin\"\n[capability]\n",
-            Path::new("/tmp/proj/eggshell.toml"),
+            Path::new("/tmp/proj/blmoadll.toml"),
             &env,
         )
         .unwrap();
@@ -692,7 +692,7 @@ prefix = "echo: "
     /// tested through files rather than through `parse`.
     fn scratch(name: &str) -> PathBuf {
         let path =
-            std::env::temp_dir().join(format!("eggshell-config-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("blmoadll-config-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
         path
@@ -883,7 +883,7 @@ command = "node"
             &[("lib/index.js", "// entry\n")],
         );
         let path = write(
-            &dir.join("eggshell.toml"),
+            &dir.join("blmoadll.toml"),
             "[plugins.thing]\nname = \"@scope/thing\"\nargs = [\"--flag\"]\n",
         );
 
@@ -910,7 +910,7 @@ command = "node"
         let nested = dir.join("profiles").join("default");
         std::fs::create_dir_all(&nested).unwrap();
         let path = write(
-            &nested.join("eggshell.toml"),
+            &nested.join("blmoadll.toml"),
             "[plugins.p]\nname = \"plain\"\n",
         );
 
@@ -976,7 +976,7 @@ command = "node"
     fn a_command_row_still_runs_its_own_program() {
         let dir = scratch("package-command");
         let path = write(
-            &dir.join("eggshell.toml"),
+            &dir.join("blmoadll.toml"),
             "[plugins.p]\ncommand = \"node\"\nargs = [\"x.js\"]\n",
         );
 
