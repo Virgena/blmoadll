@@ -1,7 +1,6 @@
 name: build-kernel
 
-# 在 blmoadll 仓库里启用：把本文件放到 .github/workflows/build-kernel.yml
-# 触发方式：① 网页上手动 Run workflow  ② 推一个 v 开头的 tag
+# 触发：① 网页手动 Run workflow  ② 推一个 v 开头的 tag（tag 触发会把产物挂到 Release，手机免登录下载）
 on:
   workflow_dispatch:
   push:
@@ -12,8 +11,10 @@ permissions:
   contents: write
 
 env:
-  # Rust 产物的二进制名，按 blmoadll 仓库实际的 crate/bin 名改
-  BIN_NAME: blmoadll
+  # install.js 的 BINS 要求两个都在，且特性必须是 fixture,host
+  BINS: "blmoadll blmoadll-fixture"
+  PACKAGE: "kernel"
+  FEATURES: "fixture,host"
 
 jobs:
   build:
@@ -36,39 +37,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Verify the bin sources are tracked
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 按 Cargo.toml 里 [[bin]] 的 path 逐个查，不关心入口放在哪个目录
+          missing=0
+          while IFS= read -r rel; do
+            f="crates/kernel/${rel}"
+            if [ ! -f "$f" ]; then
+              echo "::error title=缺少 ${f}::${f} 不在仓库里。若入口放在 src/bin/ 下，.gitignore 的 'bin/' 会吞掉它，改成 '/bin/' 或把入口移到 src/ 下"
+              missing=1
+            fi
+          done < <(grep -oE '^path[[:space:]]*=[[:space:]]*"[^"]+"' crates/kernel/Cargo.toml | grep -oE '"[^"]+"' | tr -d '"')
+          [ "$missing" -eq 0 ] || exit 1
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
       - name: Build release
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked \
+            --package "${PACKAGE}" \
+            --bins \
+            --features "${FEATURES}" \
+            --target "${{ matrix.target }}"
 
-      - name: Stage artifact
+      - name: Stage artifacts
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p out
-          src="target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.ext }}"
-          if [ ! -f "$src" ]; then
-            echo "::error::未找到构建产物 $src，请检查 Cargo.toml 里的 bin 名是否与 BIN_NAME 一致"
-            ls -la "target/${{ matrix.target }}/release/" | head -50
-            exit 1
-          fi
-          dst="out/${BIN_NAME}-${{ matrix.target }}${{ matrix.ext }}"
-          cp "$src" "$dst"
-          chmod +x "$dst" || true
+          rel="target/${{ matrix.target }}/release"
+          n=0
+          for name in ${BINS}; do
+            src="${rel}/${name}${{ matrix.ext }}"
+            if [ -f "${src}" ]; then
+              dst="out/${name}-${{ matrix.target }}${{ matrix.ext }}"
+              cp "${src}" "${dst}"
+              chmod +x "${dst}" || true
+              n=$((n + 1))
+            else
+              echo "::error::缺少 ${src}"
+              ls -la "${rel}" || true
+              exit 1
+            fi
+          done
+          echo "staged ${n} binaries"
           ls -lh out/
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          name: kernel-${{ matrix.target }}
           path: out/*
           if-no-files-found: error
           retention-days: 14
@@ -79,17 +106,12 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
-
-      - name: List files
-        run: ls -lh artifacts
-
-      - name: Publish release assets
-        uses: softprops/action-gh-release@v2
+      - run: ls -lh artifacts
+      - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
           generate_release_notes: true
