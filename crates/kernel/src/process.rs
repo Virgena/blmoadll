@@ -136,10 +136,11 @@ pub fn spawn(id: &str, spec: &PluginSpec, limits: &Limits) -> std::io::Result<(P
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     unsafe {
         // Hardening only: the contract's guarantee is that a plugin exits on its
         // own once stdin closes. Nothing here promises reaping a killed kernel.
+        // prctl is Linux only, so macOS gets the plain spawn.
         use std::os::unix::process::CommandExt;
         command.as_std_mut().pre_exec(|| {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);

@@ -39,6 +39,15 @@ jobs:
       dist_tag: ${{ steps.release.outputs.dist_tag }}
     steps:
       - uses: actions/checkout@v4
+      - name: Reject a version that is already on npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./package.json').name")"
+          if npm view "${name}@${{ inputs.version }}" version > /dev/null 2>&1; then
+            echo "::error::${{ inputs.version }} is already on npm and a published version can never be replaced; pick a new version"
+            exit 1
+          fi
       - name: Write the version everywhere
         run: node scripts/version.mjs set "${{ inputs.version }}"
       - name: Commit and tag
@@ -52,19 +61,22 @@ jobs:
           case "${version}" in
             *-*) dist_tag=dev ;;
           esac
-          if git rev-parse -q --verify "refs/tags/${tag}" > /dev/null; then
-            echo "::error::tag ${tag} already exists; pick a new version"
-            exit 1
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git diff --quiet; then
-            echo "already at ${version}; tagging the current commit"
+            echo "already at ${version}; reusing the current commit"
           else
             git commit -am "v${version}"
           fi
-          git tag "${tag}"
-          git push origin "HEAD:${GITHUB_REF_NAME}" "${tag}"
+          # A failed run leaves its tag behind. The version is not on npm yet, so
+          # moving the tag is how a re-run picks up the fix on main.
+          if git rev-parse -q --verify "refs/tags/${tag}" > /dev/null; then
+            old="$(git rev-list -n 1 "refs/tags/${tag}")"
+            echo "::notice::${tag} pointed at ${old}; moving it to $(git rev-parse HEAD)"
+          fi
+          git tag -f "${tag}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push --force origin "refs/tags/${tag}"
           echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
           echo "dist_tag=${dist_tag}" >> "${GITHUB_OUTPUT}"
 
