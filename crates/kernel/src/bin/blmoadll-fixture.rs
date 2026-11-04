@@ -1,134 +1,192 @@
-use std::path::PathBuf;
+//! A plugin that does nothing but speak the wire protocol.
+//!
+//! It is the kernel integration tests' test double, built only with
+//! `--features fixture`, so a default build never produces a binary.
+//!
+//!     blmoadll-fixture --provides demo.text [options]
+//!
+//! Options: `--injects <capability>` (repeatable), `--register <service> <capability>`,
+//! `--host-call <capability>`, `--chunks <n>`,
+//! `--exit-on-start`, `--exit-on-invoke`, `--exit-if <path>`.
+
 use std::process::ExitCode;
 
-use protocol::{read_frame, write_frame};
-use serde_json::{json, Value};
-use tokio::io::{stdin, stdout, BufReader};
+use serde_json::{Value, json};
+use tokio::io::{AsyncWriteExt, BufReader};
 
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+use protocol as proto;
+use protocol::Incoming;
 
-fn split(value: &str) -> Vec<String> {
-    value
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|part| !part.is_empty())
-        .map(str::to_owned)
-        .collect()
+const MAX_FRAME_BYTES: usize = 1 << 20;
+
+#[derive(Default)]
+struct Args {
+    provides: Vec<String>,
+    injects: Vec<Value>,
+    registrations: Vec<Value>,
+    host_calls: Vec<String>,
+    chunks: usize,
+    exit_on_start: bool,
+    exit_on_invoke: bool,
+    exit_if: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let mut provides: Vec<String> = Vec::new();
-    let mut injects: Vec<String> = Vec::new();
-    let mut exit_on_start = false;
-    let mut exit_on_invoke = false;
-    let mut exit_if: Option<PathBuf> = None;
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--provides" => provides.extend(split(&args.next().unwrap_or_default())),
-            "--injects" => injects.extend(split(&args.next().unwrap_or_default())),
-            "--exit-on-start" => exit_on_start = true,
-            "--exit-on-invoke" => exit_on_invoke = true,
-            "--exit-if" => exit_if = args.next().map(PathBuf::from),
-            other => {
-                eprintln!("blmoadll-fixture: unknown argument `{other}`");
-                return ExitCode::from(2);
+fn parse() -> Args {
+    let mut args = Args::default();
+    let mut rest = std::env::args().skip(1);
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--provides" => {
+                if let Some(capability) = rest.next() {
+                    args.provides.push(capability);
+                }
             }
+            "--injects" => {
+                if let Some(capability) = rest.next() {
+                    args.injects.push(json!({
+                        "capability": capability,
+                        "optional": false,
+                    }));
+                }
+            }
+            "--register" => {
+                if let (Some(service), Some(capability)) = (rest.next(), rest.next()) {
+                    args.registrations.push(json!({
+                        "service": service,
+                        "capability": capability,
+                    }));
+                }
+            }
+            "--host-call" => {
+                if let Some(capability) = rest.next() {
+                    args.host_calls.push(capability);
+                }
+            }
+            "--chunks" => args.chunks = rest.next().and_then(|n| n.parse().ok()).unwrap_or(0),
+            "--exit-on-start" => args.exit_on_start = true,
+            "--exit-on-invoke" => args.exit_on_invoke = true,
+            "--exit-if" => args.exit_if = rest.next(),
+            _ => {}
         }
     }
+    args
+}
 
-    if let Some(path) = exit_if {
-        tokio::spawn(async move {
-            loop {
-                if path.exists() {
-                    std::process::exit(0);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        });
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    let args = parse();
+    if args
+        .exit_if
+        .as_deref()
+        .is_some_and(|path| std::path::Path::new(path).exists())
+    {
+        return ExitCode::from(9);
     }
-
-    let injects: Vec<Value> = injects
-        .into_iter()
-        .map(|capability| json!({ "capability": capability, "optional": false }))
-        .collect();
-
-    let mut input = BufReader::new(stdin());
-    let mut output = stdout();
-
-    let reply = |id: Value, result: Value| -> Value {
-        json!({ "jsonrpc": "2.0", "id": id, "result": result })
-    };
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let mut out = tokio::io::stdout();
 
     loop {
-        let frame = match read_frame(&mut input, MAX_FRAME_BYTES).await {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("blmoadll-fixture: bad frame: {error}");
-                return ExitCode::from(1);
-            }
-        };
-
-        let message: Value = match serde_json::from_slice(&frame) {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("blmoadll-fixture: bad JSON: {error}");
-                return ExitCode::from(1);
-            }
-        };
-
-        let method = message["method"].as_str().unwrap_or_default().to_owned();
-        let has_id = message.get("id").is_some();
-        if !has_id {
-            continue;
-        }
-        let id = message["id"].clone();
-
-        let body = match method.as_str() {
-            "initialize" => reply(
-                id,
-                json!({
-                    "protocol": 3,
-                    "provides": provides.clone(),
-                    "injects": injects.clone(),
-                    "registrations": [],
-                    "host_calls": [],
-                }),
-            ),
-            "start" => {
-                if exit_on_start {
-                    return ExitCode::SUCCESS;
+        match proto::read_frame(&mut reader, MAX_FRAME_BYTES).await {
+            // stdin closed: the contract's exit path, and the only thing this
+            // test double needs to do to be a well-behaved plugin.
+            Ok(None) | Err(_) => return ExitCode::SUCCESS,
+            Ok(Some(payload)) => {
+                let Ok(incoming) = proto::parse_frame(&payload) else {
+                    continue;
+                };
+                // Notifications are not requests, so they cannot go through the
+                // match below - but the test double still says what it heard, on
+                // stderr, where the kernel's log picks it up: that is how the
+                // process-level tests prove a cancel reached a provider.
+                if let Incoming::Notification { method, params } = &incoming {
+                    if method.as_str() == proto::method::CANCEL {
+                        let id = params
+                            .get("request_id")
+                            .map(|value| value.to_string())
+                            .unwrap_or_default();
+                        eprintln!("fixture: cancelled request={id}");
+                    }
+                    continue;
                 }
-                reply(id, json!({}))
-            }
-            "invoke" => {
-                if exit_on_invoke {
-                    return ExitCode::SUCCESS;
+                let Incoming::Request { id, method, params } = incoming else {
+                    continue;
+                };
+                match method.as_str() {
+                    proto::method::INITIALIZE => {
+                        let reply = json!({
+                            "protocol": proto::PROTOCOL_VERSION,
+                            "provides": args.provides,
+                            "injects": args.injects,
+                            "registrations": args.registrations,
+                            "host_calls": args.host_calls,
+                        });
+                        send(&mut out, &proto::success(id, reply)).await;
+                    }
+                    proto::method::START => {
+                        send(&mut out, &proto::success(id, json!({}))).await;
+                        if args.exit_on_start {
+                            return ExitCode::from(3);
+                        }
+                    }
+                    proto::method::SHUTDOWN => {
+                        // The reason the kernel was given, echoed on stderr: the
+                        // same way the tests see which reason a host really sent.
+                        let reason = params.get("reason").and_then(Value::as_str).unwrap_or("?");
+                        eprintln!("fixture: shutdown reason={reason}");
+                        send(&mut out, &proto::success(id, json!({}))).await;
+                        return ExitCode::SUCCESS;
+                    }
+                    proto::method::INVOKE => {
+                        if args.exit_on_invoke {
+                            return ExitCode::from(7);
+                        }
+                        let inner = params.get("params").cloned().unwrap_or(Value::Null);
+                        let streaming = params
+                            .get("meta")
+                            .and_then(|meta| meta.get("stream"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if !streaming {
+                            send(&mut out, &proto::success(id, json!({ "got": inner }))).await;
+                            continue;
+                        }
+                        // The reply comes first: the kernel wires the mapping
+                        // from it, so chunks before it would be orphans.
+                        send(&mut out, &proto::success(id, json!({ "stream_id": "s-1" }))).await;
+                        for n in 0..args.chunks {
+                            let chunk = json!({
+                                "stream_id": "s-1",
+                                "seq": n,
+                                "data": { "delta": format!("c{n}") },
+                                "done": false,
+                            });
+                            send(&mut out, &proto::notify(proto::method::STREAM_CHUNK, chunk))
+                                .await;
+                        }
+                        let terminal = json!({
+                            "stream_id": "s-1",
+                            "seq": args.chunks,
+                            "data": null,
+                            "done": true,
+                        });
+                        send(
+                            &mut out,
+                            &proto::notify(proto::method::STREAM_CHUNK, terminal),
+                        )
+                        .await;
+                    }
+                    other => {
+                        let error = proto::RpcError::new(-32601, format!("no {other} here"));
+                        send(&mut out, &proto::failure(id, &error)).await;
+                    }
                 }
-                let params = message["params"].clone();
-                reply(
-                    id,
-                    json!({
-                        "capability": params["capability"],
-                        "method": params["method"],
-                        "params": params["params"],
-                    }),
-                )
             }
-            "shutdown" => {
-                let encoded = serde_json::to_vec(&reply(id, json!({}))).unwrap_or_default();
-                let _ = write_frame(&mut output, &encoded).await;
-                return ExitCode::SUCCESS;
-            }
-            _ => reply(id, json!({})),
-        };
-
-        let encoded = serde_json::to_vec(&body).unwrap_or_default();
-        if let Err(error) = write_frame(&mut output, &encoded).await {
-            eprintln!("blmoadll-fixture: cannot write a frame: {error}");
-            return ExitCode::from(1);
         }
     }
+}
+
+async fn send(out: &mut tokio::io::Stdout, frame: &Value) {
+    let body = serde_json::to_vec(frame).unwrap_or_else(|_| b"null".to_vec());
+    let _ = proto::write_frame(out, &body).await;
+    let _ = out.flush().await;
 }

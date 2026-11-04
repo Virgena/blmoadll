@@ -12,6 +12,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - run: node scripts/version.mjs check
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:

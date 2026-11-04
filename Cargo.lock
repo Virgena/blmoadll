@@ -48,7 +48,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kernel"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "libc",
  "loader",
@@ -66,7 +66,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "loader"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "protocol",
  "serde",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "logger"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "serde_json",
 ]
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.1.0"
+version = "0.2.0-dev.1"
 dependencies = [
  "serde_json",
  "tokio",

@@ -1,4 +1,4 @@
 target/
-bin/
+/bin/
 platforms/*/bin/
 artifacts/

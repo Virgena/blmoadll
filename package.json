@@ -1,6 +1,6 @@
 {
   "name": "@virgena/blmoadll",
-  "version": "0.1.0",
+  "version": "0.2.0-dev.1",
   "description": "blmoadll kernel binaries: blmoadll (host) + blmoadll-fixture (proxy plugin), for use with the Node host.",
   "type": "module",
   "main": "index.js",
@@ -26,10 +26,12 @@
   "scripts": {
     "build:bin": "node install.js",
     "prepack": "node install.js --stage platforms/win32-x64/bin",
-    "test:pack": "node scripts/verify-pack.mjs"
+    "test:pack": "node scripts/verify-pack.mjs",
+    "version:check": "node scripts/version.mjs check",
+    "version:set": "node scripts/version.mjs set"
   },
   "optionalDependencies": {
-    "@virgena/blmoadll-win32-x64": "0.1.0"
+    "@virgena/blmoadll-win32-x64": "0.2.0-dev.1"
   },
   "repository": {
     "type": "git",

@@ -1,0 +1,116 @@
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release: 0.2.0 for stable, 0.2.0-dev.1 for a developer build"
+        required: true
+        type: string
+      npm:
+        description: "Also publish to npm (needs the NPM_TOKEN secret)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+
+  bump:
+    name: bump, commit, tag
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      dist_tag: ${{ steps.release.outputs.dist_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write the version everywhere
+        run: node scripts/version.mjs set "${{ inputs.version }}"
+      - name: Commit and tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="v${version}"
+          dist_tag=latest
+          case "${version}" in
+            *-*) dist_tag=dev ;;
+          esac
+          if git rev-parse -q --verify "refs/tags/${tag}" > /dev/null; then
+            echo "::error::tag ${tag} already exists; pick a new version"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "already at ${version}; tagging the current commit"
+          else
+            git commit -am "v${version}"
+          fi
+          git tag "${tag}"
+          git push origin "HEAD:${GITHUB_REF_NAME}" "${tag}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "dist_tag=${dist_tag}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: build and release
+    needs: bump
+    uses: ./.github/workflows/build-kernel.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}
+    permissions:
+      contents: write
+
+  npm:
+    name: publish to npm
+    needs: [bump, build]
+    if: inputs.npm
+    runs-on: windows-latest
+    env:
+      BLMOADLL_BIN: stage
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-x86_64-pc-windows-msvc
+          path: artifacts
+      - name: Rename the release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage
+          cp artifacts/blmoadll-x86_64-pc-windows-msvc.exe stage/blmoadll.exe
+          cp artifacts/blmoadll-fixture-x86_64-pc-windows-msvc.exe stage/blmoadll-fixture.exe
+          ls -l stage
+      - name: Stage the release binaries into the platform package
+        run: npm run prepack
+      - name: Publish the platform package first
+        run: npm publish ./platforms/win32-x64 --tag "${{ needs.bump.outputs.dist_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish the main package
+        run: npm publish --tag "${{ needs.bump.outputs.dist_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

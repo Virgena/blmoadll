@@ -1,8 +1,13 @@
 name: build-kernel
 
-# 触发：① 网页手动 Run workflow  ② 推一个 v 开头的 tag（tag 触发会把产物挂到 Release，手机免登录下载）
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to attach the artifacts to; it must equal the version in Cargo.toml with a v prefix. Empty means build without creating a release."
+        type: string
+        default: ""
   push:
     tags:
       - "v*"
@@ -11,7 +16,6 @@ permissions:
   contents: write
 
 env:
-  # install.js 的 BINS 要求两个都在，且特性必须是 fixture,host
   BINS: "blmoadll blmoadll-fixture"
   PACKAGE: "kernel"
   FEATURES: "fixture,host"
@@ -36,12 +40,27 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Verify the version matches the tag
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${TAG}" ]; then
+            node scripts/version.mjs check --tag "${TAG}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            node scripts/version.mjs check --tag "${GITHUB_REF_NAME}"
+          else
+            node scripts/version.mjs check
+          fi
 
       - name: Verify the bin sources are tracked
         shell: bash
         run: |
           set -euo pipefail
-          # 按 Cargo.toml 里 [[bin]] 的 path 逐个查，不关心入口放在哪个目录
           missing=0
           while IFS= read -r rel; do
             f="crates/kernel/${rel}"
@@ -103,7 +122,7 @@ jobs:
   release:
     name: attach to release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -113,6 +132,8 @@ jobs:
       - run: ls -lh artifacts
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: artifacts/*
           generate_release_notes: true
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
           fail_on_unmatched_files: true

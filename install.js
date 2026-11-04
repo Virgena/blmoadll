@@ -111,7 +111,8 @@ if (!stage && fromPlatform()) {
   process.exit(0);
 }
 
-const source = stage ? fromCargo() : fromEnv() ?? fromTarget() ?? fromCargo();
+// BLMOADLL_BIN wins everywhere, so CI can stage the binaries it already built instead of compiling again.
+const source = fromEnv() ?? (stage ? fromCargo() : fromTarget() ?? fromCargo());
 mkdirSync(binDir, { recursive: true });
 for (const bin of BINS) {
   if (!has(source, bin.name)) {

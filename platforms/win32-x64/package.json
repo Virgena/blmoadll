@@ -1,6 +1,6 @@
 {
   "name": "@virgena/blmoadll-win32-x64",
-  "version": "0.1.0",
+  "version": "0.2.0-dev.1",
   "description": "Windows x64 binaries for @virgena/blmoadll.",
   "os": [
     "win32"
