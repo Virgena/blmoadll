@@ -39,13 +39,16 @@ jobs:
       dist_tag: ${{ steps.release.outputs.dist_tag }}
     steps:
       - uses: actions/checkout@v4
+      - name: Show the dispatch inputs
+        run: echo "version=${{ inputs.version }} npm=${{ inputs.npm }}"
       - name: Reject a version that is already on npm
+        if: ${{ inputs.npm == true || inputs.npm == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           name="$(node -p "require('./package.json').name")"
           if npm view "${name}@${{ inputs.version }}" version > /dev/null 2>&1; then
-            echo "::error::${{ inputs.version }} is already on npm and a published version can never be replaced; pick a new version"
+            echo "::error::${{ inputs.version }} is already on npm and a published version can never be replaced; pick a new version, or untick the npm input to release without publishing"
             exit 1
           fi
       - name: Write the version everywhere
@@ -92,7 +95,7 @@ jobs:
   npm:
     name: publish to npm
     needs: [bump, build]
-    if: inputs.npm
+    if: ${{ inputs.npm == true || inputs.npm == 'true' }}
     runs-on: windows-latest
     env:
       BLMOADLL_BIN: stage
