@@ -1,0 +1,96 @@
+name: build-kernel
+
+# 在 blmoadll 仓库里启用：把本文件放到 .github/workflows/build-kernel.yml
+# 触发方式：① 网页上手动 Run workflow  ② 推一个 v 开头的 tag
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  # Rust 产物的二进制名，按 blmoadll 仓库实际的 crate/bin 名改
+  BIN_NAME: blmoadll
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: .exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          src="target/${{ matrix.target }}/release/${BIN_NAME}${{ matrix.ext }}"
+          if [ ! -f "$src" ]; then
+            echo "::error::未找到构建产物 $src，请检查 Cargo.toml 里的 bin 名是否与 BIN_NAME 一致"
+            ls -la "target/${{ matrix.target }}/release/" | head -50
+            exit 1
+          fi
+          dst="out/${BIN_NAME}-${{ matrix.target }}${{ matrix.ext }}"
+          cp "$src" "$dst"
+          chmod +x "$dst" || true
+          ls -lh out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN_NAME }}-${{ matrix.target }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: attach to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List files
+        run: ls -lh artifacts
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
