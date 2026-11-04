@@ -689,13 +689,15 @@ prefix = "echo: "
     }
 
     /// Somewhere to put real files: layering is a filesystem feature, so it is
-    /// tested through files rather than through `parse`.
+    /// tested through files rather than through `parse`. The temp directory is
+    /// canonicalized because Windows runners hand out an 8.3 path (`RUNNER~1`)
+    /// while package resolution answers with the long form.
     fn scratch(name: &str) -> PathBuf {
         let path =
             std::env::temp_dir().join(format!("blmoadll-config-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
-        path
+        super::simplify(std::fs::canonicalize(&path).unwrap_or(path))
     }
 
     fn write(path: &Path, body: &str) -> PathBuf {
