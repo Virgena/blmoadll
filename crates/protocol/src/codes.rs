@@ -24,6 +24,9 @@ pub const INVALID_CONFIG: i64 = -32018;
 pub const OVERLOADED: i64 = -32019;
 pub const PAYLOAD_TOO_LARGE: i64 = -32020;
 pub const UNKNOWN_SUBSCRIPTION: i64 = -32021;
+/// The extension host could not load or unload a plugin: the module failed to
+/// evaluate, or it never started a plugin. The kernel keeps serving.
+pub const HOST_FAILED: i64 = -32022;
 
 /// Stable short name, for logs and `--check` output.
 pub fn name(code: i64) -> &'static str {
@@ -45,6 +48,7 @@ pub fn name(code: i64) -> &'static str {
         OVERLOADED => "overloaded",
         PAYLOAD_TOO_LARGE => "payload_too_large",
         UNKNOWN_SUBSCRIPTION => "unknown_subscription",
+        HOST_FAILED => "host_failed",
         _ => "unknown_code",
     }
 }

@@ -9,6 +9,8 @@ pub mod events;
 pub mod io;
 pub mod kernel;
 pub mod process;
+pub mod shared;
+pub mod trunk;
 
 pub use events::EventBus;
 pub use kernel::{Host, Kernel, Report, run};

@@ -28,12 +28,32 @@ pub fn encode(value: &Value) -> Vec<u8> {
     out
 }
 
+/// One encoded frame waiting for a writer, plus the counter it charges.
+///
+/// A shared host has one writer for every plugin's frames, so the frame, not the
+/// sink, is what remembers whose `queued_bytes` this byte count belongs to.
+pub struct Frame {
+    pub bytes: Vec<u8>,
+    pub counter: Option<Arc<AtomicUsize>>,
+}
+
+impl Frame {
+    pub fn untracked(bytes: Vec<u8>) -> Frame {
+        Frame {
+            bytes,
+            counter: None,
+        }
+    }
+}
+
 /// The kernel -> plugin direction: a queue of encoded frames plus the number of
 /// bytes still waiting to be written. The watermarks read that counter.
 #[derive(Clone)]
 pub struct Sink {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Frame>,
     bytes: Arc<AtomicUsize>,
+    /// Set on a shared host, where every frame carries the plugin it is for.
+    tag: Option<Arc<str>>,
 }
 
 impl Sink {
@@ -43,6 +63,17 @@ impl Sink {
         Sink {
             tx,
             bytes: Arc::new(AtomicUsize::new(0)),
+            tag: None,
+        }
+    }
+
+    /// A sink over `tx`, optionally tagging every frame with a plugin id. The
+    /// queue may be shared by many sinks; each sink counts only its own bytes.
+    pub fn over(tx: mpsc::UnboundedSender<Frame>, tag: Option<String>) -> Sink {
+        Sink {
+            tx,
+            bytes: Arc::new(AtomicUsize::new(0)),
+            tag: tag.map(Arc::from),
         }
     }
 
@@ -50,10 +81,27 @@ impl Sink {
         self.bytes.load(Ordering::Relaxed)
     }
 
-    fn push(&self, frame: Vec<u8>) {
-        let len = frame.len();
+    fn encoded(&self, frame: &Value) -> Vec<u8> {
+        let tagged = self.tag.as_ref().map(|tag| {
+            let mut owned = frame.clone();
+            owned["plugin"] = Value::String(tag.to_string());
+            owned
+        });
+        match &tagged {
+            Some(owned) => encode(owned),
+            None => encode(frame),
+        }
+    }
+
+    fn push(&self, frame: &Value) {
+        let encoded = self.encoded(frame);
+        let len = encoded.len();
         self.bytes.fetch_add(len, Ordering::Relaxed);
-        if self.tx.send(frame).is_err() {
+        let queued = Frame {
+            bytes: encoded,
+            counter: Some(self.bytes.clone()),
+        };
+        if self.tx.send(queued).is_err() {
             self.bytes.fetch_sub(len, Ordering::Relaxed);
         }
     }
@@ -61,17 +109,26 @@ impl Sink {
     /// Enqueues unconditionally. Events use this: dropping a subscriber's
     /// backlog is the event bus's problem, not the kernel's.
     pub fn send(&self, frame: &Value) {
-        self.push(encode(frame));
+        self.push(frame);
     }
 
     /// Enqueues only while the queue stays under `hard_limit`. `false` means the
     /// caller has to shed load.
     pub fn try_send(&self, frame: &Value, hard_limit: usize) -> bool {
-        let encoded = encode(frame);
+        let encoded = self.encoded(frame);
         if self.queued_bytes() + encoded.len() > hard_limit {
             return false;
         }
-        self.push(encoded);
+        let len = encoded.len();
+        self.bytes.fetch_add(len, Ordering::Relaxed);
+        let queued = Frame {
+            bytes: encoded,
+            counter: Some(self.bytes.clone()),
+        };
+        if self.tx.send(queued).is_err() {
+            self.bytes.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
         true
     }
 }
@@ -96,7 +153,7 @@ pub struct Frames {
     pub closed: oneshot::Receiver<()>,
 }
 
-fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
+pub(crate) fn signal_of(status: &std::process::ExitStatus) -> Option<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -154,11 +211,9 @@ pub fn spawn(id: &str, spec: &PluginSpec, limits: &Limits) -> std::io::Result<(P
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let (tx, rx) = mpsc::unbounded_channel();
-    let bytes = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::unbounded_channel::<Frame>();
     if let Some(stdin) = stdin {
-        let bytes = bytes.clone();
-        tokio::spawn(writer(stdin, rx, bytes));
+        tokio::spawn(writer(stdin, rx));
     }
 
     let (frame_tx, frame_rx) = mpsc::unbounded_channel();
@@ -218,7 +273,7 @@ pub fn spawn(id: &str, spec: &PluginSpec, limits: &Limits) -> std::io::Result<(P
         Process {
             child: Some(child),
             pid,
-            sink: Sink { tx, bytes },
+            sink: Sink::over(tx, None),
         },
         Frames {
             rx: frame_rx,
@@ -227,15 +282,19 @@ pub fn spawn(id: &str, spec: &PluginSpec, limits: &Limits) -> std::io::Result<(P
     ))
 }
 
-async fn writer<W>(mut out: W, mut rx: mpsc::UnboundedReceiver<Vec<u8>>, bytes: Arc<AtomicUsize>)
+/// Writes every queued frame, in order, and releases its byte charge only once
+/// it is actually written. One writer per pipe: frames can never interleave.
+pub(crate) async fn writer<W>(mut out: W, mut rx: mpsc::UnboundedReceiver<Frame>)
 where
     W: AsyncWrite + Unpin,
 {
     while let Some(frame) = rx.recv().await {
-        if out.write_all(&frame).await.is_err() || out.flush().await.is_err() {
+        if out.write_all(&frame.bytes).await.is_err() || out.flush().await.is_err() {
             break;
         }
-        bytes.fetch_sub(frame.len(), Ordering::Relaxed);
+        if let Some(counter) = &frame.counter {
+            counter.fetch_sub(frame.bytes.len(), Ordering::Relaxed);
+        }
     }
 }
 

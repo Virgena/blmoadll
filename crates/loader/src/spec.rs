@@ -18,6 +18,27 @@ pub const MIB: usize = 1024 * 1024;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
+    /// The `[kernel.host]` table: one process that hosts every eligible Node
+    /// plugin. `None` means one process per plugin, exactly as before.
+    #[serde(default)]
+    pub host: Option<HostRow>,
+    /// The `[kernel.runtime]` table: one process that owns every plugin. When
+    /// it is set the plugin rows belong to that process and the kernel starts
+    /// no plugin of its own.
+    #[serde(default)]
+    pub runtime: Option<HostRow>,
+    /// How long the kernel waits for the Runtime's first capability snapshot
+    /// before it calls the launch failed.
+    #[serde(default = "d_runtime_ready_ms")]
+    pub runtime_ready_ms: u64,
+    /// How many times the kernel may restart the host inside one window.
+    #[serde(default = "d_host_restarts")]
+    pub host_restarts: usize,
+    #[serde(default = "d_host_restart_window_ms")]
+    pub host_restart_window_ms: u64,
+    /// How often the kernel asks the host if it is still responsive.
+    #[serde(default = "d_host_ping_ms")]
+    pub host_ping_ms: u64,
     #[serde(default = "d_initialize_timeout")]
     pub initialize_timeout_ms: u64,
     #[serde(default = "d_start_timeout")]
@@ -64,6 +85,18 @@ pub struct Limits {
     pub io_line_bytes: usize,
 }
 
+fn d_host_restarts() -> usize {
+    3
+}
+fn d_runtime_ready_ms() -> u64 {
+    30_000
+}
+fn d_host_restart_window_ms() -> u64 {
+    600_000
+}
+fn d_host_ping_ms() -> u64 {
+    2_000
+}
 fn d_initialize_timeout() -> u64 {
     5_000
 }
@@ -134,6 +167,12 @@ fn d_io_line_bytes() -> usize {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
+            host: None,
+            runtime: None,
+            runtime_ready_ms: d_runtime_ready_ms(),
+            host_restarts: d_host_restarts(),
+            host_restart_window_ms: d_host_restart_window_ms(),
+            host_ping_ms: d_host_ping_ms(),
             initialize_timeout_ms: d_initialize_timeout(),
             start_timeout_ms: d_start_timeout(),
             shutdown_grace_ms: d_shutdown_grace(),
@@ -204,6 +243,26 @@ impl Timeouts {
     pub fn max_inflight(&self, limits: &Limits) -> usize {
         self.max_inflight.unwrap_or(limits.max_inflight)
     }
+}
+
+/// A process row, as written: `[kernel.host]` (the legacy shared host) or
+/// `[kernel.runtime]` (the Runtime that owns every plugin). Strings are raw
+/// here; the loader resolves them exactly like a plugin row's execution fields.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostRow {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub clear_env: bool,
 }
 
 /// Everything needed to start one plugin process and talk to it.

@@ -88,7 +88,23 @@ async fn main() -> ExitCode {
     // A configuration check ends here: `run` loads the config itself, so a
     // config that cannot even be parsed still comes back as a report instead of
     // a bare exit code.
+    let env = |name: &str| std::env::var(name).ok();
     if check {
+        if let Ok(config) = Config::load(&PathBuf::from(&path), &env) {
+            if config.runtime.is_some() {
+                // The plugin graph belongs to the Runtime; this check has
+                // nothing of its own to boot.
+                if json {
+                    println!(
+                        "{}",
+                        json!({"ok": true, "errors": [], "plugins": "runtime"})
+                    );
+                } else {
+                    println!("ok: kernel and runtime config (plugin checks run in the runtime)");
+                }
+                return ExitCode::from(0);
+            }
+        }
         let report = kernel::run(&PathBuf::from(&path), true).await;
         if json {
             println!("{}", report.to_json());
@@ -98,7 +114,6 @@ async fn main() -> ExitCode {
         return ExitCode::from(u8::try_from(report.code).unwrap_or(1));
     }
 
-    let env = |name: &str| std::env::var(name).ok();
     let config = match Config::load(&PathBuf::from(&path), &env) {
         Ok(config) => config,
         Err(error) => {
@@ -106,6 +121,14 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    if let Some(runtime) = config.runtime.clone() {
+        let code = kernel::trunk::run(runtime, config.limits.clone(), &path).await;
+        // Deliberately not `return ExitCode::from(...)`: dropping the runtime
+        // waits for the blocking thread parked on fd 0, and a front end may
+        // never close that pipe. Every frame is on its way out by now.
+        std::process::exit(code);
+    }
 
     let kernel = match Kernel::boot_host(config).await {
         Ok(kernel) => kernel,

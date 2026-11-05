@@ -96,13 +96,30 @@ impl Incoming {
 
 /// Parses one frame body. Trailing whitespace is tolerated.
 pub fn parse_frame(payload: &[u8]) -> Result<Incoming, RpcError> {
+    parse_tagged(payload).map(|(_, incoming)| incoming)
+}
+
+/// The same frame, plus the plugin it is for.
+///
+/// The shared extension host multiplexes every plugin over one pipe and tags
+/// each frame with the plugin id; a frame without that member is control-plane
+/// traffic. A plugin never sees the member: the host strips it before the
+/// frame reaches the plugin's channel.
+pub fn parse_tagged(payload: &[u8]) -> Result<(Option<String>, Incoming), RpcError> {
     let value: Value = serde_json::from_slice(payload)
         .map_err(|e| RpcError::new(codes::PARSE_ERROR, format!("invalid JSON: {e}")))?;
 
     let obj = value
         .as_object()
         .ok_or_else(|| RpcError::new(codes::INVALID_REQUEST, "frame must be a JSON object"))?;
+    let plugin = obj
+        .get("plugin")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((plugin, from_object(obj)?))
+}
 
+fn from_object(obj: &serde_json::Map<String, Value>) -> Result<Incoming, RpcError> {
     if let Some(err) = obj.get("error") {
         let id = obj.get("id").cloned().unwrap_or(Value::Null);
         return Ok(Incoming::ErrorResponse {
@@ -198,6 +215,25 @@ mod tests {
             }
             other => panic!("expected ErrorResponse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tags_a_frame_with_its_plugin() {
+        let (plugin, incoming) = parse_tagged(
+            br#"{"jsonrpc":"2.0","id":1,"method":"invoke","params":{},"plugin":"alpha"}"#,
+        )
+        .unwrap();
+        assert_eq!(plugin.as_deref(), Some("alpha"));
+        assert!(matches!(incoming, Incoming::Request { .. }));
+
+        let (plugin, incoming) =
+            parse_tagged(br#"{"jsonrpc":"2.0","method":"$/host/ping"}"#).unwrap();
+        assert_eq!(plugin, None);
+        assert!(matches!(incoming, Incoming::Notification { .. }));
+
+        let (plugin, _) =
+            parse_tagged(br#"{"jsonrpc":"2.0","id":3,"result":{},"plugin":"beta"}"#).unwrap();
+        assert_eq!(plugin.as_deref(), Some("beta"));
     }
 
     #[test]

@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::spec::{Limits, PluginSpec, Timeouts};
+use crate::spec::{HostRow, Limits, PluginSpec, Timeouts};
 
 #[derive(Debug, Clone)]
 pub struct ConfigError {
@@ -114,11 +114,19 @@ const EXTENDS: &str = "extends";
 struct RawConfig {
     #[serde(default)]
     kernel: Option<Limits>,
+    /// Kept opaque: in a runtime config these tables belong to the Runtime, so
+    /// the kernel must neither validate nor resolve them.
     #[serde(default)]
-    plugins: BTreeMap<String, RawPlugin>,
+    plugins: BTreeMap<String, toml::Value>,
     /// Ties only: capability id -> the plugin id that must serve it.
     #[serde(default)]
     capability: BTreeMap<String, String>,
+    /// The Runtime's own tables (`[runtime.process]`, `[runtime.config]`, ...).
+    /// The kernel never reads them; they share the file so a profile stays one
+    /// file.
+    #[serde(default)]
+    #[allow(dead_code)]
+    runtime: Option<toml::Value>,
 }
 
 /// A config file, fully resolved. This is what the kernel boots.
@@ -131,6 +139,13 @@ pub struct Config {
     /// Every file that fed this config, base first and `path` last.
     pub sources: Vec<PathBuf>,
     pub limits: Limits,
+    /// The `[kernel.host]` program, when the config asks for one. A plugin row
+    /// that speaks the same protocol may then be loaded into it instead of
+    /// getting a process of its own.
+    pub host: Option<PluginSpec>,
+    /// The `[kernel.runtime]` program, when the config asks for one. It owns
+    /// every plugin, so `plugins` is empty and the kernel starts no plugin.
+    pub runtime: Option<PluginSpec>,
     /// Plugin id -> how to run it.
     pub plugins: BTreeMap<String, PluginSpec>,
     /// Capability id -> the plugin id that must serve it.
@@ -186,12 +201,47 @@ impl Config {
         let raw: RawConfig = toml::Value::Table(table)
             .try_into()
             .map_err(|e| ConfigError::new(format!("{}: {e}", path.display())))?;
-        let limits = raw.kernel.unwrap_or_default();
+        let mut limits = raw.kernel.unwrap_or_default();
         let dir = parent_dir(path);
+        let runtime = match limits.runtime.take() {
+            Some(row) => Some(row.resolve_as("kernel.runtime", protocol::RUNTIME, &dir, env)?),
+            None => None,
+        };
+        let host = match limits.host.take() {
+            Some(row) => Some(row.resolve_as("kernel.host", protocol::HOST, &dir, env)?),
+            None => None,
+        };
+        if runtime.is_some() && host.is_some() {
+            return Err(ConfigError::at(
+                "kernel.runtime",
+                "kernel.host and kernel.runtime cannot both be set: the Runtime owns every plugin",
+            ));
+        }
+
+        // A runtime config hands every `[plugins.<id>]` table to the Runtime:
+        // the kernel starts no plugin and validates no plugin graph, so those
+        // tables stay opaque here.
+        if runtime.is_some() {
+            return Ok(Config {
+                path: path.to_path_buf(),
+                dir,
+                sources,
+                limits,
+                host: None,
+                runtime,
+                plugins: BTreeMap::new(),
+                capability: BTreeMap::new(),
+                disabled: BTreeSet::new(),
+            });
+        }
 
         let mut plugins = BTreeMap::new();
         let mut disabled = BTreeSet::new();
-        for (id, plugin) in &raw.plugins {
+        for (id, value) in &raw.plugins {
+            let plugin: RawPlugin = value.clone().try_into().map_err(|error| {
+                let field = format!("plugins.{id}");
+                ConfigError::at(&field, format!("{}: {field}: {error}", path.display()))
+            })?;
             if plugin.disabled {
                 disabled.insert(id.clone());
                 continue;
@@ -224,6 +274,8 @@ impl Config {
             dir,
             sources,
             limits,
+            host,
+            runtime,
             plugins,
             capability: raw.capability.clone(),
             disabled,
@@ -354,12 +406,144 @@ fn resolve_from(dir: &Path, target: &str) -> PathBuf {
     }
 }
 
+/// The execution half of a row: a program, its arguments, and where it starts.
+/// `[plugins.<id>]` and `[kernel.host]` both carry these fields, so they resolve
+/// through one path and cannot drift apart.
+struct Execution {
+    command: PathBuf,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    cwd: PathBuf,
+    clear_env: bool,
+}
+
+trait Row {
+    fn name(&self) -> Option<&str>;
+    fn command(&self) -> Option<&str>;
+    fn args(&self) -> &[String];
+    fn env(&self) -> &BTreeMap<String, String>;
+    fn cwd(&self) -> Option<&str>;
+    fn clear_env(&self) -> bool;
+}
+
+/// Expands every string, then resolves the row into a program to run and the
+/// arguments to run it with. A row names either a package (resolved out of the
+/// node_modules chain above the config file's directory, then run with `node`)
+/// or a `command`; `cwd` resolves against the config file's directory.
+fn resolve_execution(
+    row: &dyn Row,
+    base: &str,
+    dir: &Path,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Execution, ConfigError> {
+    let (command, args) = match (row.name(), row.command()) {
+        (Some(_), Some(_)) => {
+            return Err(ConfigError::at(
+                &format!("{base}.name"),
+                "name and command are alternatives: a row that names a package runs through node",
+            ));
+        }
+        (Some(name), None) => {
+            let name = expand(name, &format!("{base}.name"), env)?;
+            if name.trim().is_empty() {
+                return Err(ConfigError::at(
+                    &format!("{base}.name"),
+                    "name must not be empty",
+                ));
+            }
+            let entry = resolve_package(&name, dir)
+                .map_err(|message| ConfigError::at(&format!("{base}.name"), message))?;
+            let mut args = Vec::with_capacity(row.args().len() + 1);
+            args.push(entry.to_string_lossy().into_owned());
+            for (index, arg) in row.args().iter().enumerate() {
+                args.push(expand(arg, &format!("{base}.args[{index}]"), env)?);
+            }
+            (PathBuf::from("node"), args)
+        }
+        (None, Some(command)) => {
+            if command.trim().is_empty() {
+                return Err(ConfigError::at(
+                    &format!("{base}.command"),
+                    "command must not be empty",
+                ));
+            }
+            let command = expand(command, &format!("{base}.command"), env)?;
+            let mut args = Vec::with_capacity(row.args().len());
+            for (index, arg) in row.args().iter().enumerate() {
+                args.push(expand(arg, &format!("{base}.args[{index}]"), env)?);
+            }
+            (resolve_command(dir, &command), args)
+        }
+        (None, None) => {
+            return Err(ConfigError::at(
+                base,
+                "a row names either a package or a command",
+            ));
+        }
+    };
+    let cwd = match row.cwd() {
+        Some(cwd) => dir.join(expand(cwd, &format!("{base}.cwd"), env)?),
+        None => dir.to_path_buf(),
+    };
+    let mut expanded = BTreeMap::new();
+    for (key, value) in row.env() {
+        expanded.insert(
+            key.clone(),
+            expand(value, &format!("{base}.env.{key}"), env)?,
+        );
+    }
+    Ok(Execution {
+        command,
+        args,
+        env: expanded,
+        cwd,
+        clear_env: row.clear_env(),
+    })
+}
+
+impl Row for RawPlugin {
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+    fn command(&self) -> Option<&str> {
+        self.command.as_deref()
+    }
+    fn args(&self) -> &[String] {
+        &self.args
+    }
+    fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+    fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+    fn clear_env(&self) -> bool {
+        self.clear_env
+    }
+}
+
+impl Row for HostRow {
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+    fn command(&self) -> Option<&str> {
+        self.command.as_deref()
+    }
+    fn args(&self) -> &[String] {
+        &self.args
+    }
+    fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+    fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+    fn clear_env(&self) -> bool {
+        self.clear_env
+    }
+}
+
 impl RawPlugin {
-    /// Expands every string, then resolves the row into a program to run and
-    /// the arguments to run it with. A row names either a package (resolved
-    /// out of the node_modules chain above the config file's directory, then
-    /// run with `node`) or a `command`; `cwd` resolves against the config
-    /// file's directory.
     fn resolve(
         &self,
         id: &str,
@@ -367,69 +551,14 @@ impl RawPlugin {
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<PluginSpec, ConfigError> {
         let base = format!("plugins.{id}");
-        let (command, args) = match (&self.name, &self.command) {
-            (Some(_), Some(_)) => {
-                return Err(ConfigError::at(
-                    &format!("{base}.name"),
-                    "name and command are alternatives: a row that names a package runs through node",
-                ));
-            }
-            (Some(name), None) => {
-                let name = expand(name, &format!("{base}.name"), env)?;
-                if name.trim().is_empty() {
-                    return Err(ConfigError::at(
-                        &format!("{base}.name"),
-                        "name must not be empty",
-                    ));
-                }
-                let entry = resolve_package(&name, dir)
-                    .map_err(|message| ConfigError::at(&format!("{base}.name"), message))?;
-                let mut args = Vec::with_capacity(self.args.len() + 1);
-                args.push(entry.to_string_lossy().into_owned());
-                for (index, arg) in self.args.iter().enumerate() {
-                    args.push(expand(arg, &format!("{base}.args[{index}]"), env)?);
-                }
-                (PathBuf::from("node"), args)
-            }
-            (None, Some(command)) => {
-                if command.trim().is_empty() {
-                    return Err(ConfigError::at(
-                        &format!("{base}.command"),
-                        "command must not be empty",
-                    ));
-                }
-                let command = expand(command, &format!("{base}.command"), env)?;
-                let mut args = Vec::with_capacity(self.args.len());
-                for (index, arg) in self.args.iter().enumerate() {
-                    args.push(expand(arg, &format!("{base}.args[{index}]"), env)?);
-                }
-                (resolve_command(dir, &command), args)
-            }
-            (None, None) => {
-                return Err(ConfigError::at(
-                    &base,
-                    "a row names either a package or a command",
-                ));
-            }
-        };
-        let cwd = match &self.cwd {
-            Some(cwd) => dir.join(expand(cwd, &format!("{base}.cwd"), env)?),
-            None => dir.to_path_buf(),
-        };
-        let mut expanded = BTreeMap::new();
-        for (key, value) in &self.env {
-            expanded.insert(
-                key.clone(),
-                expand(value, &format!("{base}.env.{key}"), env)?,
-            );
-        }
+        let execution = resolve_execution(self, &base, dir, env)?;
         Ok(PluginSpec {
             id: id.to_string(),
-            command,
-            args,
-            env: expanded,
-            cwd,
-            clear_env: self.clear_env,
+            command: execution.command,
+            args: execution.args,
+            env: execution.env,
+            cwd: execution.cwd,
+            clear_env: execution.clear_env,
             config: match &self.config {
                 Some(value) => serde_json::to_value(value).unwrap_or(Value::Null),
                 None => Value::Object(serde_json::Map::new()),
@@ -442,6 +571,28 @@ impl RawPlugin {
                 stream_idle_timeout_ms: self.stream_idle_timeout_ms,
                 max_inflight: self.max_inflight,
             },
+        })
+    }
+}
+
+impl HostRow {
+    fn resolve_as(
+        &self,
+        field: &str,
+        id: &str,
+        dir: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<PluginSpec, ConfigError> {
+        let execution = resolve_execution(self, field, dir, env)?;
+        Ok(PluginSpec {
+            id: id.to_string(),
+            command: execution.command,
+            args: execution.args,
+            env: execution.env,
+            cwd: execution.cwd,
+            clear_env: execution.clear_env,
+            config: Value::Object(serde_json::Map::new()),
+            timeouts: Timeouts::default(),
         })
     }
 }
@@ -620,6 +771,113 @@ prefix = "echo: "
         assert_eq!(plugin.timeouts.max_inflight(&config.limits), 3);
         assert_eq!(plugin.config["prefix"], Value::from("echo: "));
         assert_eq!(config.capability["demo.text"], "provider");
+    }
+
+    #[test]
+    fn resolves_the_host_row_like_a_plugin_row() {
+        let env = env_of(&[("PREFIX", "hi")]);
+        let config = Config::parse(
+            "[kernel]\nhost_restarts = 2\n\
+             [kernel.host]\ncommand = \"${PREFIX}/node\"\nargs = [\"--host\"]\ncwd = \"sub\"\n\
+             [kernel.host.env]\nMODE = \"shared\"\n\
+             [plugins.p]\ncommand = \"demo\"\n[capability]\n",
+            Path::new("/tmp/proj/blmoadll.toml"),
+            &env,
+        )
+        .unwrap();
+        let host = config.host.expect("the host row resolves");
+        assert_eq!(host.command, config.dir.join("hi/node"));
+        assert_eq!(host.args, vec!["--host".to_string()]);
+        assert_eq!(host.env["MODE"], "shared");
+        assert_eq!(host.cwd, config.dir.join("sub"));
+        assert_eq!(config.limits.host_restarts, 2);
+        assert!(
+            config.limits.host.is_none(),
+            "the row is resolved once and then leaves the ceilings"
+        );
+        assert_eq!(config.plugins.len(), 1, "the host is not a plugin row");
+    }
+
+    #[test]
+    fn a_runtime_row_leaves_every_plugin_table_to_the_runtime() {
+        let env = env_of(&[]);
+        let config = Config::parse(
+            "[kernel]\nruntime_ready_ms = 7\n\
+             [kernel.runtime]\ncommand = \"node\"\nargs = [\"rt.js\"]\n\
+             [plugins.broken]\ncomand = \"a typo the kernel must not judge\"\n\
+             [capability]\n\"demo.text\" = \"broken\"\n",
+            Path::new("c.toml"),
+            &env,
+        )
+        .unwrap();
+        let runtime = config.runtime.expect("the runtime row resolves");
+        assert_eq!(runtime.id, protocol::RUNTIME);
+        assert_eq!(runtime.args, vec!["rt.js".to_string()]);
+        assert_eq!(config.limits.runtime_ready_ms, 7);
+        assert!(config.host.is_none());
+        assert!(
+            config.plugins.is_empty(),
+            "in runtime mode the kernel resolves no plugin row"
+        );
+        assert!(
+            config.capability.is_empty(),
+            "in runtime mode the capability pins belong to the Runtime"
+        );
+    }
+
+    #[test]
+    fn a_config_cannot_carry_a_host_row_and_a_runtime_row() {
+        let env = env_of(&[]);
+        let err = Config::parse(
+            "[kernel.host]\ncommand = \"node\"\n[kernel.runtime]\ncommand = \"node\"\n",
+            Path::new("c.toml"),
+            &env,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("cannot both be set"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn refuses_a_host_row_that_cannot_run() {
+        let env = env_of(&[]);
+        let err = Config::parse(
+            "[kernel.host]\nargs = []\n[plugins.p]\ncommand = \"demo\"\n[capability]\n",
+            Path::new("c.toml"),
+            &env,
+        )
+        .unwrap_err();
+        assert!(
+            err.message.contains("either a package or a command"),
+            "{}",
+            err.message
+        );
+
+        let err = Config::parse(
+            "[kernel.host]\ncomand = \"x\"\n[plugins.p]\ncommand = \"demo\"\n[capability]\n",
+            Path::new("c.toml"),
+            &env,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("comand"), "{}", err.message);
+        assert!(err.message.contains("kernel"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_config_without_a_host_row_gets_no_host() {
+        let env = env_of(&[]);
+        let config = Config::parse(
+            "[plugins.p]\ncommand = \"demo\"\n[capability]\n",
+            Path::new("c.toml"),
+            &env,
+        )
+        .unwrap();
+        assert!(config.host.is_none());
+        assert_eq!(config.limits.host_restarts, 3);
+        assert_eq!(config.limits.host_restart_window_ms, 600_000);
     }
 
     #[test]

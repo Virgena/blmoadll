@@ -20,6 +20,7 @@ use protocol::{HOST, Incoming, RpcError, codes, method};
 use crate::events::{Budget, EventBus};
 use crate::io::{self, Stdout};
 use crate::process::{self, Frames};
+use crate::shared::{self, SharedHost};
 use loader::graph::{self, Decl, Issue};
 use loader::{Config, ConfigError, Limits, PluginSpec};
 use loader::{RoutingTable, to_json};
@@ -28,9 +29,53 @@ use logger as log;
 /// Interval between polls of the shutdown flow, the sweeper and the reloader.
 const POLL: Duration = Duration::from_millis(20);
 
+/// How the kernel reaches one plugin: a process of its own, or a member of the
+/// shared extension host. Everything else about an instance is the same, so the
+/// lifecycle code does not branch on it.
+enum Link {
+    Process(process::Process),
+    Shared(shared::Member),
+}
+
+impl Link {
+    fn sink(&self) -> &process::Sink {
+        match self {
+            Link::Process(process) => &process.sink,
+            Link::Shared(member) => &member.sink,
+        }
+    }
+
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Link::Process(process) => process.pid,
+            Link::Shared(member) => member.host.pid(),
+        }
+    }
+
+    fn force_kill(&mut self) {
+        match self {
+            Link::Process(process) => process.force_kill(),
+            Link::Shared(member) => member.host.kill(&member.plugin),
+        }
+    }
+
+    fn is_shared(&self) -> bool {
+        matches!(self, Link::Shared(_))
+    }
+
+    /// The `{plugin, exit_code, signal}` a member reported for itself. A process
+    /// link has none until its child is waited on.
+    fn exit_detail(&self) -> Option<Value> {
+        match self {
+            Link::Process(_) => None,
+            Link::Shared(member) => member.host.exit_detail(&member.plugin),
+        }
+    }
+}
+
 struct Instance {
     cfg: PluginSpec,
-    process: process::Process,
+    link: Link,
     decl: Decl,
     /// Whole-table snapshot; reload replaces the `Arc`, never a single `Route`.
     view: Arc<RoutingTable>,
@@ -48,7 +93,7 @@ struct Instance {
 
 impl Instance {
     fn sink(&self) -> &process::Sink {
-        &self.process.sink
+        self.link.sink()
     }
 }
 
@@ -106,6 +151,19 @@ struct State {
     /// it the io primitives - belongs to the embedder. Claiming fd 0/1 here
     /// would corrupt the host protocol.
     host_mode: bool,
+    /// The shared extension host, while one is running.
+    extension: Option<Arc<SharedHost>>,
+    /// The plugin that was loading when the host last died, counted per plugin.
+    /// Memory only: a restart of the kernel forgets every strike.
+    host_strikes: BTreeMap<String, u8>,
+    /// Plugins this run must not host again: two crashes are enough.
+    host_quarantined: BTreeSet<String>,
+    /// How many times the host was restarted, and when the current window began.
+    host_restarts: usize,
+    host_window: Option<Instant>,
+    /// The last aggregate host status, so a plugin that restarts with the host
+    /// can ask for it instead of waiting for the next change.
+    host_status: Value,
 }
 
 pub struct Kernel {
@@ -217,6 +275,22 @@ fn from_config_error(error: ConfigError) -> Issue {
     }
 }
 
+/// A row is hosted when it runs Node itself with exactly one argument (the
+/// entry) and asks for nothing the host cannot honor per row. A non-Node
+/// program, extra arguments, a working directory or an environment of its own
+/// keeps its own process, which is what makes the mixed profile work.
+fn shared_eligible(spec: &PluginSpec, config_dir: &Path) -> bool {
+    let node = spec
+        .command
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("node"));
+    node && spec.args.len() == 1
+        && spec.env.is_empty()
+        && !spec.clear_env
+        && spec.cwd.as_path() == config_dir
+}
+
 fn str_field(params: &Value, key: &str) -> String {
     params
         .get(key)
@@ -262,6 +336,17 @@ impl Kernel {
 
     fn host_mode(&self) -> bool {
         self.state.lock().unwrap().host_mode
+    }
+
+    /// A plugin that lives in the extension host has no terminal of its own:
+    /// fd 0/1 belong to the host and to the kernel protocol.
+    fn shared_member(&self, plugin: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .plugins
+            .get(plugin)
+            .is_some_and(|instance| instance.link.is_shared())
     }
 
     /// This kernel is somebody's subprocess: fd 0 and fd 1 are the host
@@ -339,6 +424,7 @@ impl Kernel {
                 json!({
                     "id": id,
                     "command": instance.cfg.command.display().to_string(),
+                    "host": if instance.link.is_shared() { "shared" } else { "process" },
                     "provides": instance.decl.provides,
                     "injects": instance.decl.injects.iter()
                         .map(|r| json!({"capability": r.capability, "optional": r.optional}))
@@ -375,22 +461,63 @@ impl Kernel {
         // handed back to a caller who wants to know them.
         let mut report = kernel.report.lock().unwrap().clone();
         let mut decls: BTreeMap<String, Decl> = BTreeMap::new();
-        for id in kernel.ids() {
-            let (timeout, plugin_config) = {
-                let state = kernel.state.lock().unwrap();
-                let instance = state.plugins.get(&id).unwrap();
-                (
-                    instance.cfg.timeouts.initialize(&state.config.limits),
-                    instance.cfg.config.clone(),
-                )
+        let ids = kernel.ids();
+        // Initialize is per plugin: nothing it does depends on another plugin's
+        // declaration, so every plugin is asked at once and the answers are
+        // applied in id order, which keeps the first reported error stable.
+        let mut outcomes: BTreeMap<String, Result<Value, RpcError>> = BTreeMap::new();
+        {
+            let mut set = tokio::task::JoinSet::new();
+            for id in &ids {
+                let (timeout, plugin_config) = {
+                    let state = kernel.state.lock().unwrap();
+                    let instance = state.plugins.get(id).unwrap();
+                    (
+                        instance.cfg.timeouts.initialize(&state.config.limits),
+                        instance.cfg.config.clone(),
+                    )
+                };
+                let params = json!({
+                    "protocol": proto::PROTOCOL_VERSION,
+                    "plugin_id": id,
+                    "kernel_version": env!("CARGO_PKG_VERSION"),
+                    "config": plugin_config,
+                });
+                let caller = kernel.clone();
+                let plugin = id.clone();
+                set.spawn(async move {
+                    let outcome = caller
+                        .call(&plugin, method::INITIALIZE, params, timeout)
+                        .await;
+                    (plugin, outcome)
+                });
+            }
+            let mut joined_all = true;
+            while let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok((id, outcome)) => {
+                        outcomes.insert(id, outcome);
+                    }
+                    Err(error) => {
+                        joined_all = false;
+                        log::error("kernel", &format!("an initialize task failed: {error}"));
+                    }
+                }
+            }
+            if !joined_all {
+                report.errors.push(Issue::error(
+                    codes::INTERNAL_ERROR,
+                    "a plugin's initialize task did not finish",
+                ));
+                return Err(kernel.cleanup(report).await);
+            }
+        }
+        for id in ids {
+            let outcome = match outcomes.remove(&id) {
+                Some(outcome) => outcome,
+                None => continue,
             };
-            let params = json!({
-                "protocol": proto::PROTOCOL_VERSION,
-                "plugin_id": id,
-                "kernel_version": env!("CARGO_PKG_VERSION"),
-                "config": plugin_config,
-            });
-            match kernel.call(&id, method::INITIALIZE, params, timeout).await {
+            match outcome {
                 Ok(reply) => {
                     let protocol = reply.get("protocol").and_then(Value::as_u64).unwrap_or(0);
                     if protocol != proto::PROTOCOL_VERSION as u64 {
@@ -536,6 +663,22 @@ impl Kernel {
 
         report.plugins = kernel.plugin_report();
         *kernel.report.lock().unwrap() = report;
+
+        let hosted = kernel.hosted_ids().len();
+        let total = kernel.state.lock().unwrap().plugins.len();
+        let has_host = kernel.state.lock().unwrap().extension.is_some();
+        log::info(
+            "kernel",
+            &format!(
+                "boot: {total} plugins, {} host, {} processes",
+                usize::from(has_host),
+                total.saturating_sub(hosted)
+            ),
+        );
+        if has_host {
+            kernel.publish_status("ready", hosted, total, None);
+            kernel.clone().supervise();
+        }
         Ok(kernel)
     }
 
@@ -555,11 +698,11 @@ impl Kernel {
                 id.clone(),
                 Instance {
                     cfg: cfg.clone(),
-                    process: process::Process {
+                    link: Link::Process(process::Process {
                         child: None,
                         pid: None,
                         sink: process::Sink::closed(),
-                    },
+                    }),
                     decl: Decl {
                         id: id.clone(),
                         provides: Vec::new(),
@@ -612,6 +755,12 @@ impl Kernel {
                 inflight_total: 0,
                 check_mode: check,
                 host_mode: host,
+                extension: None,
+                host_strikes: BTreeMap::new(),
+                host_quarantined: BTreeSet::new(),
+                host_restarts: 0,
+                host_window: None,
+                host_status: json!({ "state": "ready", "ready": 0, "total": 0 }),
             }),
             attached,
             shutdown_tx,
@@ -631,27 +780,50 @@ impl Kernel {
     }
 
     async fn start_processes(self: Arc<Self>) -> Result<(), Report> {
-        let plugs: Vec<(String, PluginSpec)> = {
+        let (plugs, config) = {
             let state = self.state.lock().unwrap();
-            state
-                .plugins
-                .iter()
-                .map(|(id, i)| (id.clone(), i.cfg.clone()))
-                .collect()
+            (
+                state
+                    .plugins
+                    .iter()
+                    .map(|(id, i)| (id.clone(), i.cfg.clone()))
+                    .collect::<Vec<_>>(),
+                state.config.clone(),
+            )
         };
-        let config = self.state.lock().unwrap().config.clone();
+        if let Some(spec) = &config.host {
+            match SharedHost::spawn(spec, &config.limits) {
+                Ok(host) => self.state.lock().unwrap().extension = Some(host),
+                Err(error) => {
+                    let mut report = self.report.lock().unwrap().clone();
+                    report.errors.push(
+                        Issue::error(
+                            codes::INVALID_CONFIG,
+                            format!("cannot start kernel.host: {error}"),
+                        )
+                        .at("kernel.host"),
+                    );
+                    return Err(self.cleanup(report).await);
+                }
+            }
+        }
         let mut frames: Vec<(String, Frames)> = Vec::new();
+        let mut shared: Vec<String> = Vec::new();
         for (id, cfg) in plugs {
-            match process::spawn(&id, &cfg, &config.limits) {
-                Ok((process, stream)) => {
+            match self.install(&id, &cfg, &config) {
+                Ok((link, stream)) => {
+                    let is_shared = link.is_shared();
                     self.state
                         .lock()
                         .unwrap()
                         .plugins
                         .get_mut(&id)
                         .unwrap()
-                        .process = process;
-                    frames.push((id, stream));
+                        .link = link;
+                    frames.push((id.clone(), stream));
+                    if is_shared {
+                        shared.push(id);
+                    }
                 }
                 Err(error) => {
                     let mut report = self.report.lock().unwrap().clone();
@@ -669,7 +841,318 @@ impl Kernel {
         for (id, stream) in frames {
             self.clone().dispatch(id, stream);
         }
+        let failures = self.load_shared(&shared).await;
+        if let Some((id, error)) = failures.into_iter().next() {
+            let mut report = self.report.lock().unwrap().clone();
+            report.errors.push(
+                Issue::error(
+                    error.code,
+                    format!("`{id}` failed to load: {}", error.message),
+                )
+                .at(format!("plugins.{id}")),
+            );
+            return Err(self.cleanup(report).await);
+        }
         Ok(())
+    }
+
+    /// Creates a new link for one plugin: a member of the running host when the
+    /// row is eligible for it, otherwise a process of its own.
+    fn install(
+        &self,
+        id: &str,
+        cfg: &PluginSpec,
+        config: &Config,
+    ) -> std::io::Result<(Link, Frames)> {
+        let host = self.state.lock().unwrap().extension.clone();
+        if let Some(host) = host.filter(|_| shared_eligible(cfg, &config.dir)) {
+            let (member, frames) = host.join(id);
+            return Ok((Link::Shared(member), frames));
+        }
+        process::spawn(id, cfg, &config.limits)
+            .map(|(process, frames)| (Link::Process(process), frames))
+    }
+
+    /// Marks a plugin unavailable without a lifecycle of its own: the host
+    /// refused to load it, or it never came back. Its channel, if any, is
+    /// dropped so nothing waits on it.
+    fn mark_gone(&self, id: &str, detail: Value) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(instance) = state.plugins.get_mut(id) {
+            instance.link.force_kill();
+            instance.gone = Some(detail);
+            instance.inflight = 0;
+            instance.waiting.clear();
+        }
+    }
+
+    fn hosted_ids(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .plugins
+            .iter()
+            .filter(|(_, instance)| instance.link.is_shared())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Counts one strike against a plugin and reports whether that quarantines
+    /// it. Two strikes are enough; the record never reaches disk.
+    fn strike(&self, plugin: &str) -> bool {
+        let mut state = self.state.lock().unwrap();
+        let count = state.host_strikes.entry(plugin.to_string()).or_insert(0);
+        *count += 1;
+        if *count >= 2 {
+            state.host_quarantined.insert(plugin.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// One restart inside the current window, or `false` when the budget is
+    /// spent. The counter resets when the window has passed.
+    fn take_restart(&self) -> (usize, bool) {
+        let limits = self.cfg();
+        let mut state = self.state.lock().unwrap();
+        let now = Instant::now();
+        let expired = state
+            .host_window
+            .map(|start| {
+                now.duration_since(start) > Duration::from_millis(limits.host_restart_window_ms)
+            })
+            .unwrap_or(true);
+        if expired {
+            state.host_window = Some(now);
+            state.host_restarts = 0;
+        }
+        if state.host_restarts >= limits.host_restarts {
+            (state.host_restarts, false)
+        } else {
+            state.host_restarts += 1;
+            (state.host_restarts, true)
+        }
+    }
+
+    fn publish_status(&self, state: &str, ready: usize, total: usize, plugin: Option<&str>) {
+        let mut payload = json!({ "state": state, "ready": ready, "total": total });
+        if let Some(plugin) = plugin {
+            payload["plugin"] = json!(plugin);
+        }
+        self.state.lock().unwrap().host_status = payload.clone();
+        let size = payload.to_string().len();
+        self.publish_event("kernel.host.status", payload, size);
+    }
+
+    /// Watches the extension host for the whole life of the kernel.
+    fn supervise(self: Arc<Self>) {
+        let host = self.state.lock().unwrap().extension.clone();
+        let Some(host) = host else { return };
+        {
+            // A host that stops answering is killed, which turns a hang into the
+            // crash the supervisor already knows how to handle.
+            let host = host.clone();
+            let kernel = self.clone();
+            tokio::spawn(async move {
+                let limits = kernel.cfg();
+                let interval = Duration::from_millis(limits.host_ping_ms.max(10));
+                let timeout = (limits.host_ping_ms.saturating_mul(4)).max(1_000);
+                loop {
+                    tokio::time::sleep(interval).await;
+                    if kernel.is_stopping() || kernel.any_shutting_down() {
+                        return;
+                    }
+                    if !host.ping(timeout).await {
+                        log::error("kernel", "the extension host stopped answering; killing it");
+                        host.shutdown().await;
+                        return;
+                    }
+                }
+            });
+        }
+        tokio::spawn(async move {
+            let mut died = host.died();
+            while died.changed().await.is_ok() {
+                let death = *died.borrow();
+                let Some(death) = death else { continue };
+                let offender = host.last_loading().or_else(|| host.last_crash());
+                self.clone().on_host_death(death, offender).await;
+                return;
+            }
+        });
+    }
+
+    fn any_shutting_down(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .plugins
+            .values()
+            .any(|instance| instance.shutting_down)
+    }
+
+    async fn on_host_death(self: Arc<Self>, death: shared::HostDeath, offender: Option<String>) {
+        if self.is_stopping() {
+            return;
+        }
+        log::error(
+            "kernel",
+            &format!(
+                "the extension host exited (code {:?}, signal {:?})",
+                death.exit_code, death.signal
+            ),
+        );
+        let hosted = self.hosted_ids();
+        self.publish_event(
+            "kernel.host.exited",
+            json!({
+                "exit_code": death.exit_code,
+                "signal": death.signal,
+                "plugin": offender,
+                "total": hosted.len(),
+            }),
+            160,
+        );
+        // The reader closed every member already; let the lifecycle code finish
+        // before a new member is joined under the same id.
+        for id in &hosted {
+            self.await_gone(id, 2_000).await;
+        }
+
+        let quarantined = match &offender {
+            Some(plugin) if self.strike(plugin) => true,
+            _ => false,
+        };
+        let (restarts, allowed) = self.take_restart();
+        if !allowed {
+            log::error(
+                "kernel",
+                "the extension host restarted too often; the hosted plugins stay down",
+            );
+            self.publish_status("failed", 0, hosted.len(), offender.as_deref());
+            return;
+        }
+        let fresh = self.state.lock().unwrap().config.clone();
+        match self.clone().restart_host(&fresh, &hosted).await {
+            Ok(ready) => {
+                if quarantined {
+                    self.publish_event(
+                        "kernel.host.quarantined",
+                        json!({ "plugin": offender, "ready": ready, "total": hosted.len() }),
+                        160,
+                    );
+                }
+                self.publish_event(
+                    "kernel.host.restarted",
+                    json!({ "ready": ready, "total": hosted.len(), "restarts": restarts }),
+                    128,
+                );
+                let state = if ready == hosted.len() {
+                    "ready"
+                } else {
+                    "recovering"
+                };
+                self.publish_status(state, ready, hosted.len(), offender.as_deref());
+            }
+            Err(error) => {
+                log::error(
+                    "kernel",
+                    &format!("the extension host did not restart: {}", error.message),
+                );
+                self.publish_status("failed", 0, hosted.len(), offender.as_deref());
+            }
+        }
+    }
+
+    async fn restart_host(
+        self: Arc<Self>,
+        fresh: &Config,
+        hosted: &[String],
+    ) -> Result<usize, RpcError> {
+        let spec = fresh
+            .host
+            .as_ref()
+            .ok_or_else(|| RpcError::new(codes::INVALID_CONFIG, "no kernel.host to restart"))?;
+        let host = SharedHost::spawn(spec, &fresh.limits).map_err(|error| {
+            RpcError::new(
+                codes::INVALID_CONFIG,
+                format!("cannot start kernel.host: {error}"),
+            )
+        })?;
+        self.state.lock().unwrap().extension = Some(host);
+        let quarantined = self.state.lock().unwrap().host_quarantined.clone();
+        let ids: Vec<String> = hosted
+            .iter()
+            .filter(|id| !quarantined.contains(*id) && fresh.plugins.contains_key(*id))
+            .cloned()
+            .collect();
+        self.clone()
+            .bring_up(&ids, fresh, &[], proto::trigger::HOST)
+            .await?;
+        self.clone().settle(fresh, &[], proto::trigger::HOST).await;
+        let ready = {
+            let state = self.state.lock().unwrap();
+            ids.iter()
+                .filter(|id| {
+                    state
+                        .plugins
+                        .get(*id)
+                        .is_some_and(|instance| instance.started && instance.gone.is_none())
+                })
+                .count()
+        };
+        self.clone().supervise();
+        Ok(ready)
+    }
+
+    async fn shutdown_extension(&self) {
+        let host = self.state.lock().unwrap().extension.take();
+        if let Some(host) = host {
+            host.shutdown().await;
+        }
+    }
+
+    /// Loads every shared member's module, concurrently, and reports the ones
+    /// that failed by plugin id. Loading is per plugin: one broken module does
+    /// not stop the others from being asked.
+    async fn load_shared(self: &Arc<Self>, ids: &[String]) -> BTreeMap<String, RpcError> {
+        let mut set = tokio::task::JoinSet::new();
+        for id in ids {
+            let wanted = {
+                let state = self.state.lock().unwrap();
+                let instance = match state.plugins.get(id) {
+                    Some(instance) => instance,
+                    None => continue,
+                };
+                let host = match &instance.link {
+                    Link::Shared(member) => member.host.clone(),
+                    Link::Process(_) => continue,
+                };
+                let entry = instance.cfg.args.first().cloned().unwrap_or_default();
+                let timeout = instance.cfg.timeouts.initialize(&state.config.limits);
+                (host, entry, timeout)
+            };
+            let plugin = id.clone();
+            set.spawn(async move {
+                let outcome = wanted.0.load(&plugin, &wanted.1, wanted.2).await;
+                (plugin, outcome)
+            });
+        }
+        let mut failures = BTreeMap::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((id, Err(error))) => {
+                    log::warn(
+                        "host",
+                        &format!("plugin={id} failed to load: {}", error.message),
+                    );
+                    failures.insert(id, error);
+                }
+                Ok((_, Ok(()))) => {}
+                Err(error) => log::warn("host", &format!("a load task failed: {error}")),
+            }
+        }
+        failures
     }
 
     fn first_gone(&self) -> Option<Value> {
@@ -751,6 +1234,19 @@ impl Kernel {
     }
 
     async fn on_request(self: Arc<Self>, plugin: String, id: Value, name: String, params: Value) {
+        // The host control plane is the kernel's, never a plugin's: a plugin
+        // that could load or kill its siblings would own the whole set.
+        if name.starts_with("$/host/") {
+            self.reply(
+                &plugin,
+                id,
+                Err(RpcError::new(
+                    codes::METHOD_NOT_FOUND,
+                    format!("{name} is the kernel's host control plane"),
+                )),
+            );
+            return;
+        }
         match name.as_str() {
             method::KERNEL_INVOKE => self.plugin_invoke(&plugin, id, params).await,
             method::KERNEL_PUBLISH => {
@@ -1486,7 +1982,30 @@ impl Kernel {
                 "patterns must not be empty",
             ));
         }
-        let id = self.state.lock().unwrap().bus.subscribe(plugin, patterns);
+        let id = self
+            .state
+            .lock()
+            .unwrap()
+            .bus
+            .subscribe(plugin, patterns.clone());
+        let replay = params
+            .get("replay")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // A plugin that restarts with the host missed the status changes that
+        // brought it back; one current frame is the whole state, not a log.
+        if replay
+            && patterns
+                .iter()
+                .any(|pattern| crate::events::matches_topic(pattern, "kernel.host.status"))
+        {
+            let payload = self.state.lock().unwrap().host_status.clone();
+            let frame = proto::notify(
+                method::EVENT,
+                json!({ "topic": "kernel.host.status", "seq": 0, "payload": payload }),
+            );
+            self.send(plugin, &frame);
+        }
         Ok(json!({ "subscription_id": format!("sub-{id}") }))
     }
 
@@ -1537,7 +2056,7 @@ impl Kernel {
     // ------------------------------------------------------------------- io
 
     fn attach(&self, plugin: &str, params: &Value) -> Result<Value, RpcError> {
-        if self.host_mode() {
+        if self.host_mode() || self.shared_member(plugin) {
             return Err(Self::no_terminal(method::KERNEL_ATTACH));
         }
         let stream = str_field(params, "stream");
@@ -1580,7 +2099,7 @@ impl Kernel {
     }
 
     fn detach(&self, plugin: &str, params: &Value) -> Result<Value, RpcError> {
-        if self.host_mode() {
+        if self.host_mode() || self.shared_member(plugin) {
             return Err(Self::no_terminal(method::KERNEL_DETACH));
         }
         {
@@ -1685,7 +2204,7 @@ impl Kernel {
     // ------------------------------------------------------------ lifecycle
 
     async fn start_plugin(&self, id: &str, trigger: &'static str) -> Result<(), RpcError> {
-        let (caps, timeout, pid, check, cwd, command, args) = {
+        let (caps, timeout, pid, check, cwd, command, args, shared) = {
             let state = self.state.lock().unwrap();
             let instance = match state.plugins.get(id) {
                 Some(instance) => instance,
@@ -1699,11 +2218,12 @@ impl Kernel {
             (
                 to_json(&state.table),
                 instance.cfg.timeouts.start(&state.config.limits),
-                instance.process.pid,
+                instance.link.pid(),
                 state.check_mode,
                 instance.cfg.cwd.display().to_string(),
                 instance.cfg.command.display().to_string(),
                 instance.cfg.args.clone(),
+                instance.link.is_shared(),
             )
         };
         // The snapshot handed over here is a starting reference; changes arrive
@@ -1721,6 +2241,7 @@ impl Kernel {
                 "plugin": id,
                 "pid": pid,
                 "trigger": trigger,
+                "host": shared,
                 "cwd": cwd,
                 "command": command,
                 "args": args,
@@ -1783,7 +2304,7 @@ impl Kernel {
             let mut state = self.state.lock().unwrap();
             for instance in state.plugins.values_mut() {
                 if instance.gone.is_none() {
-                    instance.process.force_kill();
+                    instance.link.force_kill();
                     killed += 1;
                 }
             }
@@ -1798,6 +2319,7 @@ impl Kernel {
         }
         self.wait_until_gone().await;
         self.force_kill_remaining().await;
+        self.shutdown_extension().await;
     }
 
     async fn cleanup(&self, mut report: Report) -> Report {
@@ -2086,16 +2608,19 @@ impl Kernel {
         removed: &[String],
         trigger: &'static str,
     ) -> Result<(), RpcError> {
+        let recovering = trigger == proto::trigger::HOST;
         let mut frames: Vec<(String, Frames)> = Vec::new();
+        let mut shared: Vec<String> = Vec::new();
         for id in new_ids {
             let cfg = fresh.plugins.get(id).unwrap().clone();
-            match process::spawn(id, &cfg, &fresh.limits) {
-                Ok((process, stream)) => {
+            match self.install(id, &cfg, fresh) {
+                Ok((link, stream)) => {
+                    let is_shared = link.is_shared();
                     self.state.lock().unwrap().plugins.insert(
                         id.clone(),
                         Instance {
                             cfg,
-                            process,
+                            link,
                             decl: Decl {
                                 id: id.clone(),
                                 provides: Vec::new(),
@@ -2111,12 +2636,19 @@ impl Kernel {
                             gone: None,
                             shutting_down: false,
                             stop_trigger: None,
-                            start_trigger: proto::trigger::BOOT,
+                            start_trigger: trigger,
                         },
                     );
                     frames.push((id.clone(), stream));
+                    if is_shared {
+                        shared.push(id.clone());
+                    }
                 }
                 Err(error) => {
+                    if recovering {
+                        log::warn("host", &format!("plugin={id} cannot come back: {error}"));
+                        continue;
+                    }
                     self.abort_reload(&new_ids, trigger).await;
                     return Err(RpcError::new(
                         codes::INVALID_CONFIG,
@@ -2127,6 +2659,30 @@ impl Kernel {
         }
         for (id, stream) in frames {
             self.clone().dispatch(id, stream);
+        }
+        let failures = self.load_shared(&shared).await;
+        if let Some((id, error)) = failures.into_iter().next() {
+            if !recovering {
+                self.abort_reload(&new_ids, trigger).await;
+                return Err(RpcError::new(
+                    error.code,
+                    format!("`{id}` failed to load: {}", error.message),
+                ));
+            }
+            log::warn(
+                "host",
+                &format!("plugin={id} stays unavailable: {}", error.message),
+            );
+            self.mark_gone(
+                &id,
+                json!({
+                    "plugin": id,
+                    "exit_code": null,
+                    "signal": null,
+                    "host": true,
+                    "message": error.message,
+                }),
+            );
         }
 
         // 2. initialize the new instances, then check the whole new graph.
@@ -2160,6 +2716,14 @@ impl Kernel {
                         decls.insert(id.clone(), decl);
                     }
                     Err(issue) => {
+                        if recovering {
+                            log::warn("host", &format!("plugin={id}: {}", issue.message));
+                            self.mark_gone(
+                                id,
+                                json!({ "plugin": id, "exit_code": null, "signal": null, "host": true }),
+                            );
+                            continue;
+                        }
                         self.abort_reload(&new_ids, trigger).await;
                         return Err(RpcError::new(
                             issue.code,
@@ -2168,6 +2732,17 @@ impl Kernel {
                     }
                 },
                 Err(error) => {
+                    if recovering {
+                        log::warn(
+                            "host",
+                            &format!("plugin={id} failed to initialize: {}", error.message),
+                        );
+                        self.mark_gone(
+                            id,
+                            json!({ "plugin": id, "exit_code": null, "signal": null, "host": true }),
+                        );
+                        continue;
+                    }
                     self.abort_reload(&new_ids, trigger).await;
                     return Err(RpcError::new(
                         error.code,
@@ -2250,7 +2825,7 @@ impl Kernel {
         for id in ids {
             if let Some(instance) = state.plugins.get_mut(id) {
                 if instance.gone.is_none() {
-                    instance.process.force_kill();
+                    instance.link.force_kill();
                 }
             }
             state.plugins.remove(id);
@@ -2292,7 +2867,7 @@ impl Kernel {
         for id in &ids {
             if let Some(instance) = state.plugins.get_mut(id) {
                 if instance.gone.is_none() {
-                    instance.process.force_kill();
+                    instance.link.force_kill();
                 }
             }
             state.plugins.remove(id);
@@ -2420,7 +2995,7 @@ impl Kernel {
             {
                 let mut state = self.state.lock().unwrap();
                 if let Some(instance) = state.plugins.get_mut(id) {
-                    instance.process.force_kill();
+                    instance.link.force_kill();
                 }
             }
             self.await_gone(id, grace).await;
@@ -2479,7 +3054,7 @@ impl Kernel {
             {
                 let mut state = self.state.lock().unwrap();
                 if let Some(instance) = state.plugins.get_mut(id) {
-                    instance.process.force_kill();
+                    instance.link.force_kill();
                 }
             }
             if !self.await_gone(id, grace).await {
@@ -2509,26 +3084,47 @@ impl Kernel {
     }
 
     async fn on_closed(self: Arc<Self>, plugin: &str) {
-        // `wait` can yield, so the child is taken out of the lock first.
-        let child = {
-            let mut state = self.state.lock().unwrap();
+        let shared = {
+            let state = self.state.lock().unwrap();
+            matches!(state.plugins.get(plugin), Some(instance) if instance.link.is_shared())
+        };
+        let detail = if shared {
+            // The host reported the exit itself; there is no child to wait on.
+            let state = self.state.lock().unwrap();
             state
                 .plugins
-                .get_mut(plugin)
-                .and_then(|i| i.process.child.take())
-        };
-        let mut child = child;
-        let status = match child.as_mut() {
-            Some(inner) => inner.wait().await.ok(),
-            None => None,
-        };
-        {
-            let mut state = self.state.lock().unwrap();
-            if let Some(instance) = state.plugins.get_mut(plugin) {
-                instance.process.child = child;
+                .get(plugin)
+                .and_then(|instance| instance.link.exit_detail())
+                .unwrap_or_else(
+                    || json!({ "plugin": plugin, "exit_code": null, "signal": null, "host": true }),
+                )
+        } else {
+            // `wait` can yield, so the child is taken out of the lock first.
+            let child = {
+                let mut state = self.state.lock().unwrap();
+                state
+                    .plugins
+                    .get_mut(plugin)
+                    .and_then(|i| match &mut i.link {
+                        Link::Process(process) => process.child.take(),
+                        Link::Shared(_) => None,
+                    })
+            };
+            let mut child = child;
+            let status = match child.as_mut() {
+                Some(inner) => inner.wait().await.ok(),
+                None => None,
+            };
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(instance) = state.plugins.get_mut(plugin) {
+                    if let Link::Process(process) = &mut instance.link {
+                        process.child = child;
+                    }
+                }
             }
-        }
-        let detail = process::exit_payload(plugin, status);
+            process::exit_payload(plugin, status)
+        };
 
         let (expected, check_mode, orphans, failed, trigger) = {
             let mut state = self.state.lock().unwrap();
@@ -2715,8 +3311,9 @@ impl Kernel {
                 .map(|(id, instance)| {
                     json!({
                         "plugin": id,
-                        "pid": instance.process.pid,
+                        "pid": instance.link.pid(),
                         "trigger": instance.start_trigger,
+                        "host": instance.link.is_shared(),
                         "cwd": instance.cfg.cwd.display().to_string(),
                         "command": instance.cfg.command.display().to_string(),
                         "args": instance.cfg.args,

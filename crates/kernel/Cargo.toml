@@ -37,3 +37,13 @@ required-features = ["host"]
 name = "host_process"
 path = "tests/host_process.rs"
 required-features = ["fixture", "host"]
+
+[[test]]
+name = "host_shared"
+path = "tests/host_shared.rs"
+required-features = ["fixture", "host"]
+
+[[test]]
+name = "trunk"
+path = "tests/trunk.rs"
+required-features = ["fixture", "host"]
